@@ -12,12 +12,14 @@
 import pg from 'pg';
 import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import 'dotenv/config';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OLLAMA_HOST = process.env.TAG_OLLAMA_HOST || 'http://localhost:11434';
 const MODEL = process.env.TAG_MODEL || 'qwen2.5-coder:7b';
 const CONCURRENCY = parseInt(process.env.TAG_CONCURRENCY || '3', 10);
-const MONOREPO_ROOT = '/home/agent/homelab';
+const MONOREPO_ROOT = process.env.MONOREPO_ROOT || path.resolve(__dirname, '../../..');
 
 const pool = new pg.Pool({
     host: process.env.DB_HOST || '10.0.0.144',
