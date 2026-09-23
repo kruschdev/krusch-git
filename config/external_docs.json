@@ -1,0 +1,22 @@
+[
+  {
+    "name": "cloudflare-agents-docs",
+    "url": "https://developers.cloudflare.com/docs-for-agents/llms-full.txt"
+  },
+  {
+    "name": "anthropic-docs",
+    "url": "https://docs.anthropic.com/en/llms-full.txt"
+  },
+  {
+    "name": "structured-output-benchmark",
+    "url": "https://huggingface.co/datasets/interfaze-ai/sob/raw/main/README.md"
+  },
+  {
+    "name": "polygres-docs",
+    "url": "https://raw.githubusercontent.com/Evokoa/polygres-sdk/main/README.md"
+  },
+  {
+    "name": "openrouter-docs",
+    "url": "https://openrouter.ai/docs/llms.txt"
+  }
+]

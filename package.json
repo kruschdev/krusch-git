@@ -1,0 +1,45 @@
+{
+  "name": "krusch-git",
+  "version": "1.2.0",
+  "description": "Intelligent Git DAG, AST chunking, and codebase symbol search engine for AI coding agents. SQLite & PostgreSQL compatible.",
+  "main": "server/index.js",
+  "bin": {
+    "krusch-git": "./server/mcp.js",
+    "pg-git-mcp": "./server/mcp.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kruschdev/krusch-git.git"
+  },
+  "files": [
+    "server",
+    "db",
+    "lib",
+    "scripts",
+    "client/dist",
+    "config.js"
+  ],
+  "scripts": {
+    "test": "node --env-file=.env --test tests/*.test.js",
+
+    "dev": "node server/index.js & cd client && npm run dev",
+    "mcp": "node server/mcp.js",
+    "snapshot": "node scripts/sync_to_pg.js",
+    "sync-all": "node scripts/sync_all_projects.js",
+    "import": "node scripts/import_github.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pg": "^8.20.0"
+  }
+}
