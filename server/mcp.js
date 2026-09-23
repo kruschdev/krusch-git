@@ -28,30 +28,29 @@ import { pool } from '../db/pool.js';
 async function verifyDatabase() {
     try {
         await pool.query('SELECT 1');
-        console.error('[pg-git-mcp] Database connection verified.');
+        console.error('[krusch-git] Database connection verified.');
     } catch (err) {
-        console.error('[pg-git-mcp] FATAL: Cannot reach PostgreSQL:', err.message);
+        console.error('[krusch-git] FATAL: Cannot reach PostgreSQL:', err.message);
         process.exit(1);
     }
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 const server = new Server(
-    { name: "pg-git-mcp", version: "1.1.0" },
+    { name: "krusch-git", version: "1.2.0" },
     { capabilities: { tools: {} } }
 );
-
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
         tools: [
             {
-                name: "pg_git_list_repos",
-                description: "List all available PG-Git repositories stored in the database.",
+                name: "krusch_git_list_repos",
+                description: "List all available repositories stored in the database.",
                 inputSchema: { type: "object", properties: {} }
             },
             {
-                name: "pg_git_read_tree",
+                name: "krusch_git_read_tree",
                 description: "Read the directory structure (DAG node) of a specific repository. If tree_id is omitted, it attempts to read the root tree of the 'main' branch.",
                 inputSchema: {
                     type: "object",
@@ -63,7 +62,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 }
             },
             {
-                name: "pg_git_read_blob",
+                name: "krusch_git_read_blob",
                 description: "Read the file contents of a specific blob.",
                 inputSchema: {
                     type: "object",
@@ -74,8 +73,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 }
             },
             {
-                name: "pg_git_semantic_search",
-                description: "Search code files in PG-Git using Hybrid RRF (BM25 + pgvector), pure semantic vector, or keyword search. Results are decayed by age.",
+                name: "krusch_git_semantic_search",
+                description: "Search code files using Hybrid RRF (BM25 + pgvector), pure semantic vector, or keyword search. Results are decayed by age.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -87,14 +86,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             default: "hybrid" 
                         },
                         limit: { type: "number", description: "Number of results to return.", default: 5 },
-                        project: { type: "string", description: "Optional project name to filter search (e.g., 'annotated', 'signet', 'krusch-dbos-mcp')." },
+                        project: { type: "string", description: "Optional project name to filter search (e.g., 'annotated', 'signet', 'krusch-context-mcp')." },
                         repository_id: { type: "number", description: "Optional repository ID to limit search to a specific repo." }
                     },
                     required: ["query"]
                 }
             },
             {
-                name: "pg_git_search_symbols",
+                name: "krusch_git_search_symbols",
                 description: "Search for specific code symbols (functions, classes, methods, routes) across repositories with exact match boost, signatures, and line ranges.",
                 inputSchema: {
                     type: "object",
@@ -109,7 +108,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 }
             },
             {
-                name: "pg_git_file_symbols",
+                name: "krusch_git_file_symbols",
                 description: "List all code symbols (functions, classes, methods, routes) declared inside a specific file blob.",
                 inputSchema: {
                     type: "object",
@@ -120,7 +119,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 }
             },
             {
-                name: "pg_git_dependency_graph",
+                name: "krusch_git_dependency_graph",
                 description: "Trace symbol dependencies: retrieve outbound imports, inbound callers/dependents, and declared symbols for a specific file path.",
                 inputSchema: {
                     type: "object",
@@ -137,15 +136,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const rawName = request.params.name;
+    const name = rawName.replace(/^pg_git_/, 'krusch_git_');
+    if (rawName.startsWith('pg_git_')) {
+        console.error(`[krusch-git] Notice: Tool '${rawName}' is aliased to '${name}'.`);
+    }
     const args = request.params.arguments || {};
+
     try {
-        if (request.params.name === "pg_git_list_repos") {
+        if (name === "krusch_git_list_repos") {
             const repos = await getRepositories();
             const output = repos.map(r => `ID: ${r.id} | Name: ${r.name} | Desc: ${r.description}`).join('\n');
             return {
                 content: [{ type: "text", text: output || "No repositories found." }]
             };
-        } else if (request.params.name === "pg_git_read_tree") {
+        } else if (name === "krusch_git_read_tree") {
             const { repository_id, tree_id } = args;
             let targetTree = tree_id;
             
@@ -164,7 +169,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const output = entries.map(e => `[${e.type.toUpperCase()}] ${e.name} (Object ID: ${e.object_id})`).join('\n');
             return { content: [{ type: "text", text: `Tree contents for ${targetTree}:\n\n${output}` }] };
 
-        } else if (request.params.name === "pg_git_read_blob") {
+        } else if (name === "krusch_git_read_blob") {
             const { blob_id } = args;
             const blob = await getBlob(blob_id);
             if (!blob) {
@@ -178,7 +183,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const textContent = buffer.toString('utf-8');
             return { content: [{ type: "text", text: textContent }] };
             
-        } else if (request.params.name === "pg_git_semantic_search") {
+        } else if (name === "krusch_git_semantic_search") {
             const { query: searchQuery, limit = 5, repository_id, project, search_type = "hybrid" } = args;
             
             // Resolve project name to repository_id if provided
@@ -214,7 +219,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
             return { content: [{ type: "text", text: output }] };
 
-        } else if (request.params.name === "pg_git_search_symbols") {
+        } else if (name === "krusch_git_search_symbols") {
             const { query: searchQuery, limit = 10, repository_id, project, symbol_type } = args;
             
             let resolvedRepoId = repository_id;
@@ -242,7 +247,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
             return { content: [{ type: "text", text: output }] };
 
-        } else if (request.params.name === "pg_git_file_symbols") {
+        } else if (name === "krusch_git_file_symbols") {
             const { blob_id } = args;
             const symbols = await getSymbolsForBlob(blob_id);
             if (symbols.length === 0) {
@@ -255,7 +260,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
             return { content: [{ type: "text", text: output }] };
 
-        } else if (request.params.name === "pg_git_dependency_graph") {
+        } else if (name === "krusch_git_dependency_graph") {
             const { file_path, repository_id, project } = args;
 
             let resolvedRepoId = repository_id;
@@ -304,16 +309,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             return { content: [{ type: "text", text: output }] };
 
-
-
         } else {
-            throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+            throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${rawName}`);
         }
     } catch (err) {
         // Re-throw MCP errors directly so the SDK handles them properly
         if (err instanceof McpError) throw err;
         return {
-            content: [{ type: "text", text: `[Error] Failed executing ${request.params.name}: ${err.message}` }],
+            content: [{ type: "text", text: `[Error] Failed executing ${rawName}: ${err.message}` }],
             isError: true
         };
     }
@@ -321,7 +324,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 async function shutdown() {
-    console.error('[pg-git-mcp] Shutting down...');
+    console.error('[krusch-git] Shutting down...');
     try { await pool.end(); } catch (_) { /* best-effort */ }
     process.exit(0);
 }
@@ -333,10 +336,17 @@ async function main() {
     await verifyDatabase();
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("[pg-git-mcp] Server running on stdio");
+    console.error("[krusch-git] Server running on stdio");
 }
 
-main().catch(err => {
-    console.error("[Fatal]", err);
-    process.exit(1);
-});
+import { fileURLToPath } from 'node:url';
+
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isDirectRun) {
+    main().catch(err => {
+        console.error("[Fatal]", err);
+        process.exit(1);
+    });
+}
+
+export { server, verifyDatabase };

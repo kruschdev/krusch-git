@@ -31,19 +31,14 @@ To guarantee production-grade stability and complete continuity across complex m
 
 ## 🤝 Sibling Synergy with Krusch Context MCP
 
-PG-Git serves two distinct, first-class deployment models:
-1. **Standalone Codebase RAG Engine (`pg-git-mcp@1.1.0`)**: An independent, lightweight MCP server providing Git DAG indexing, hybrid RRF search, and AST symbol extraction for developers who only want codebase search in their IDE or custom agent pipelines.
-2. **Shared Substrate with [Krusch Context MCP](https://github.com/kruschdev/krusch-context-mcp)**: Krusch Context MCP incorporates the native consolidated codebase engine while sharing the exact same PostgreSQL schema (`repositories`, `blobs`, `code_symbols`, `code_symbol_edges`, `trees`, `commits`, `branches`).
+Krusch-Git and [krusch-context-mcp](https://github.com/kruschdev/krusch-context-mcp) form a complementary two-server architecture for AI coding agents:
 
-| Layer | Source Table | Purpose |
-|-------|--------------|---------|
-| **Codebase Memory (The "What" & "How")** | `blobs`, `code_symbols`, `code_symbol_edges` | Semantically embedded source files, AST symbols, and dependency edges |
-| **Episodic Memory (The "Why")** | `ide_agent_memory`, `interaction_memory` | Architectural decisions, bugs encountered, project goals |
-| **Holographic Nuggets (The "How to Behave")** | `ide_agent_nuggets` | Lightweight steering facts, user preferences, project conventions |
+| Server | Responsibility | Verbs / Tools |
+|---|---|---|
+| **[krusch-context-mcp](https://github.com/kruschdev/krusch-context-mcp)** | Project memory, episodic decisions, steering invariants | 5 core verbs (`retrieve`, `remember`, `revise`, `nudge`, `health`) |
+| **[krusch-git](https://github.com/kruschdev/krusch-git)** | Codebase AST, symbol search, Git DAG indexing | 7 tools (`krusch_git_search_symbols`, `krusch_git_semantic_search`, ...) |
 
-**Infinite Continuity**: When using Krusch Context MCP, your agent cross-references the *intent* (episodic memory) with the *implementation* (codebase blobs and AST symbols). It remembers *why* you chose a specific architecture, and instantly sees *how* it's currently implemented, creating a deeply contextualized and autonomous coding workflow that persists across infinite sessions.
-
-> 🔗 **See the full unified server documentation:** [Krusch Context MCP README](https://github.com/kruschdev/krusch-context-mcp)
+**Separation of Concerns**: Memory and codebase indexing are decoupled. Your agent uses `krusch-context-mcp` to know *why* architectural decisions were made and *what* rules to follow, and queries `krusch-git` to find *where* code lives, how symbols connect, and what the Git history looks like.
 
 ## ⚡ Quick Start
 
@@ -53,10 +48,10 @@ ollama pull bge-large
 ```
 
 **1. Clone & Migrate Database**
-You will need a running PostgreSQL instance with `pgvector` enabled.
+You will need a running PostgreSQL instance with `pgvector` enabled (or local SQLite adapter).
 ```bash
-git clone https://github.com/kruschdev/pg-git.git
-cd pg-git
+git clone https://github.com/kruschdev/krusch-git.git
+cd krusch-git
 npm install
 cp .env.example .env
 # Edit .env with your PostgreSQL credentials
@@ -68,24 +63,20 @@ node db/migrate.js
 > [!WARNING]
 > **Choose your embedding model carefully.** You must set your preferred model (via the Web UI Settings tab or `.env`) *before* running your first import or snapshot. If you change models later, vector dimensions will collide and you will be forced to manually wipe the database and re-embed all repositories from scratch.
 
-You can instantly import any local `.git` repository. PG-Git will natively parse the Git history, generate semantic embeddings for all blobs, and securely deduplicate them into PostgreSQL:
+You can instantly import any local `.git` repository. Krusch-Git will natively parse the Git history, generate semantic embeddings for all blobs, and securely deduplicate them into PostgreSQL:
 ```bash
 npm run import
 ```
 
-**3a. Use via Krusch Context MCP (Recommended)**
+**3. Configure in Your Agent / IDE**
 
-The recommended way to use PG-Git across the homelab fleet is through the flagship [Krusch Context MCP](https://github.com/kruschdev/krusch-context-mcp) unified server, which natively incorporates PG-Git's Git DAG, AST symbol parsing, dependency graph traversal, and hybrid RRF search into a 59-tool unified working memory server alongside episodic memory, steering facts, and AI Watch research engines. See the [Krusch Context MCP Quick Start](https://github.com/kruschdev/krusch-context-mcp#-quick-start) for setup instructions.
-
-**3b. Use Standalone MCP Server**
-
-If you prefer to run PG-Git as an isolated MCP server, you can execute it directly via NPM. Add it to your agent/IDE configuration (e.g., `mcp_config.json`):
+Add Krusch-Git to your agent/IDE configuration (e.g., `mcp_config.json`):
 ```json
 {
   "mcpServers": {
-    "pg-git-mcp": {
+    "krusch-git": {
       "command": "npx",
-      "args": ["-y", "pg-git-mcp"],
+      "args": ["-y", "krusch-git"],
       "env": {
         "PG_CONNECTION_STRING": "postgres://user:pass@localhost:5434/kruschdb",
         "OLLAMA_URL": "http://localhost:11434",
@@ -96,30 +87,29 @@ If you prefer to run PG-Git as an isolated MCP server, you can execute it direct
 }
 ```
 
+*(Note: `pg-git-mcp` remains available as an alias command for backward compatibility).*
+
 **4. Start the Web UI (Optional)**
-PG-Git includes a sleek, dual-pane IDE interface for browsing your semantic repositories.
+Krusch-Git includes a sleek, dual-pane IDE interface for browsing your semantic repositories.
 ```bash
 npm run dev
 ```
 
 ---
 
-## 🔧 MCP Tools (Standalone Mode)
+## 🔧 MCP Tools Reference
 
-When running PG-Git as a standalone MCP server (`server/mcp.js`), it exposes 7 specialized tools:
+When running Krusch-Git as an MCP server (`server/mcp.js`), it exposes 7 canonical tools with automatic backward-compatible aliases:
 
-| Tool | Description |
-|------|-------------|
-| `pg_git_list_repos` | List all available Git repositories indexed in PostgreSQL |
-| `pg_git_read_tree` | Browse repository file tree and directory entries |
-| `pg_git_read_blob` | Read full source file content by blob SHA |
-| `pg_git_semantic_search` | Hybrid RRF search (dense cosine + BM25 full-text) with temporal decay (`search_type: 'hybrid' \| 'semantic' \| 'keyword'`) |
-| `pg_git_search_symbols` | Search extracted AST code symbols (functions, classes, methods, routes) across repositories |
-| `pg_git_file_symbols` | Get all AST symbols declared in a specific file or blob |
-| `pg_git_dependency_graph` | Trace inbound callers, outbound imports, and dependencies up to $N$ hops |
-
-> [!NOTE]
-> When using **Krusch Context MCP**, all these capabilities are natively consolidated under unified tool names (`krusch_context_search_code`, `krusch_context_search_symbols`, `krusch_context_symbol_graph`, `krusch_context_read_tree`, `krusch_context_read_blob`, `krusch_context_list_repos`) alongside 50+ memory, nugget, and AI research tools. Both servers support the same `pg_git_*` aliases for universal compatibility.
+| Canonical Tool | Alias (Backward Compat) | Description |
+|---|---|---|
+| `krusch_git_list_repos` | `pg_git_list_repos` | List all available repositories indexed in PostgreSQL |
+| `krusch_git_read_tree` | `pg_git_read_tree` | Browse repository file tree and directory entries |
+| `krusch_git_read_blob` | `pg_git_read_blob` | Read full source file content by blob SHA |
+| `krusch_git_semantic_search` | `pg_git_semantic_search` | Hybrid RRF search (dense cosine + BM25 full-text) with temporal decay (`search_type: 'hybrid' \| 'semantic' \| 'keyword'`) |
+| `krusch_git_search_symbols` | `pg_git_search_symbols` | Search extracted AST code symbols (functions, classes, methods, routes) across repositories |
+| `krusch_git_file_symbols` | `pg_git_file_symbols` | Get all AST symbols declared in a specific file or blob |
+| `krusch_git_dependency_graph` | `pg_git_dependency_graph` | Trace inbound callers, outbound imports, and dependencies up to $N$ hops |
 
 ---
 
@@ -249,25 +239,26 @@ PG-Git's PostgreSQL schema maps Git objects and code structure directly into SQL
 - **`code_symbols`** — Structural AST-extracted functions, classes, methods, and routes with signatures and exact `start_line`/`end_line` ranges
 - **`code_symbol_edges`** — Relational dependency graph tracking outbound `imports` and inbound callers/dependents across files
 
-### MCP Tools Reference (v1.1.0)
+### MCP Tools Reference (v1.2.0)
 
-When running PG-Git as an MCP server (`npx pg-git-mcp` or `node server/mcp.js`), the following 7 tools are available:
+When running Krusch-Git as an MCP server (`npx krusch-git` or `node server/mcp.js`), the following 7 tools are available:
 
 | Tool Name | Parameters | Description |
 |---|---|---|
-| `pg_git_list_repos` | *(none)* | List all available PG-Git repositories stored in PostgreSQL |
-| `pg_git_read_tree` | `repository_id`, `tree_id?` | Read directory structure (DAG node) of a repo |
-| `pg_git_read_blob` | `blob_id` | Read file contents of a specific blob |
-| `pg_git_semantic_search` | `query`, `search_type?`, `limit?`, `project?`, `repository_id?` | Hybrid RRF (BM25 + pgvector), pure semantic, or keyword search with temporal decay |
-| `pg_git_search_symbols` | `query`, `symbol_type?`, `limit?`, `project?`, `repository_id?` | Search for functions, classes, methods, or routes with signatures and line ranges |
-| `pg_git_file_symbols` | `blob_id` | List all code symbols declared inside a specific file blob |
-| `pg_git_dependency_graph` | `file_path`, `repository_id?`, `project?` | Trace outbound imports, inbound dependents, and declared symbols for a file |
+| `krusch_git_list_repos` | *(none)* | List all available repositories stored in PostgreSQL |
+| `krusch_git_read_tree` | `repository_id`, `tree_id?` | Read directory structure (DAG node) of a repo |
+| `krusch_git_read_blob` | `blob_id` | Read file contents of a specific blob |
+| `krusch_git_semantic_search` | `query`, `search_type?`, `limit?`, `project?`, `repository_id?` | Hybrid RRF (BM25 + pgvector), pure semantic, or keyword search with temporal decay |
+| `krusch_git_search_symbols` | `query`, `symbol_type?`, `limit?`, `project?`, `repository_id?` | Search for functions, classes, methods, or routes with signatures and line ranges |
+| `krusch_git_file_symbols` | `blob_id` | List all code symbols declared inside a specific file blob |
+| `krusch_git_dependency_graph` | `file_path`, `repository_id?`, `project?` | Trace outbound imports, inbound dependents, and declared symbols for a file |
+
+*(Legacy tool calls using `pg_git_*` prefix are automatically redirected).*
 
 ### 🔬 Research Foundations (2026 Code-RAG)
 - **GRASP (arXiv: 2607.10463)**: Granularity-aware retrieval across symbol definitions and whole-file trees.
 - **Reciprocal Rank Fusion (RRF)**: $RRF(d) = \frac{1}{60 + r_{\text{dense}}} + \frac{1}{60 + r_{\text{bm25}}}$, fused with exponential temporal decay $\exp(-0.01 \times age_{\text{days}})$.
 - **CodexGraph & CocoIndex**: Structural graph navigation linking call sites, imports, and AST declarations.
-
 
 ---
 
@@ -275,9 +266,8 @@ When running PG-Git as an MCP server (`npx pg-git-mcp` or `node server/mcp.js`),
 
 | Project | Role |
 |---------|------|
-| **[Krusch Context MCP](https://github.com/kruschdev/krusch-context-mcp)** | Unified IDE context server — wraps PG-Git + episodic memory + nuggets into a single MCP process |
-| [PG-Git MCP on NPM](https://www.npmjs.com/package/pg-git-mcp) | This project published to the NPM registry |
-| [NeoVertex Nuggets](https://github.com/NeoVertex1/nuggets) | Original Holographic Nuggets MCP architecture adapted in Krusch Context |
+| **[Krusch Context MCP](https://github.com/kruschdev/krusch-context-mcp)** | Local 5-verb project memory and invariant steering server (`retrieve`, `remember`, `revise`, `nudge`, `health`) |
+| **[Krusch Git](https://github.com/kruschdev/krusch-git)** | Codebase AST, symbol search, Git DAG indexing, and dependency graphs |
 
 ## License
 ISC License. Created by [kruschdev](https://github.com/kruschdev).
