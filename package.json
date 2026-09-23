@@ -4,8 +4,8 @@
   "description": "Intelligent Git DAG, AST chunking, and codebase symbol search engine for AI coding agents. SQLite & PostgreSQL compatible.",
   "main": "server/index.js",
   "bin": {
-    "krusch-git": "./server/mcp.js",
-    "pg-git-mcp": "./server/mcp.js"
+    "krusch-git": "bin/cli.js",
+    "pg-git-mcp": "bin/cli.js"
   },
   "engines": {
     "node": ">=22.0.0"
@@ -15,6 +15,7 @@
     "url": "git+https://github.com/kruschdev/krusch-git.git"
   },
   "files": [
+    "bin",
     "server",
     "db",
     "lib",
@@ -24,7 +25,6 @@
   ],
   "scripts": {
     "test": "node --env-file=.env --test tests/*.test.js",
-
     "dev": "node server/index.js & cd client && npm run dev",
     "mcp": "node server/mcp.js",
     "snapshot": "node scripts/sync_to_pg.js",
