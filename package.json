@@ -1,6 +1,6 @@
 {
   "name": "krusch-git",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Intelligent Git DAG, AST chunking, and codebase symbol search engine for AI coding agents. PostgreSQL + pgvector.",
   "main": "server/index.js",
   "bin": {
