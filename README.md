@@ -1,10 +1,10 @@
 # Krusch-Git (Codebase & Git AST Memory Engine)
 
-A persistent Git DAG indexer, AST chunker, and semantic codebase retrieval engine for AI coding agents. Stores the entire Directed Acyclic Graph (DAG) natively, extracting code symbols, call edges, and chunked semantic vector embeddings. Compatible with both local SQLite and PostgreSQL.
+A persistent Git DAG indexer, AST chunker, and semantic codebase retrieval engine for AI coding agents. Stores the entire Directed Acyclic Graph (DAG) natively in PostgreSQL with pgvector, extracting code symbols, call edges, and chunked semantic vector embeddings.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/Node.js-22+-green.svg)
-![Storage](https://img.shields.io/badge/Storage-SQLite%20%2F%20PostgreSQL-lightgrey.svg)
+![Storage](https://img.shields.io/badge/Storage-PostgreSQL%20%2B%20pgvector-lightgrey.svg)
 
 ## 🧠 Why Krusch-Git?
 
@@ -16,16 +16,16 @@ In the standard AI coding agent ecosystem, searching codebases relies on rigid g
 
 ## ⚠️ Not a Replacement for Git
 
-It is critical to understand that PG-Git **does not replace Git** or services like GitHub/GitLab. It does not handle branch merging, rebasing, or pull requests. 
+It is critical to understand that Krusch-Git **does not replace Git** or services like GitHub/GitLab. It does not handle branch merging, rebasing, or pull requests. 
 
-Instead, PG-Git is an **agentic augmentation layer**. You continue to use standard Git for your human-facing source control and team collaboration. PG-Git sits alongside it in your workflow, automatically ingesting your standard Git history to provide your AI agents with a mathematically optimized, semantically searchable clone of your codebase.
+Instead, Krusch-Git is an **agentic augmentation layer**. You continue to use standard Git for your human-facing source control and team collaboration. Krusch-Git sits alongside it in your workflow, automatically ingesting your standard Git history to provide your AI agents with a mathematically optimized, semantically searchable clone of your codebase.
 
 ## 🔒 Reliability Audit & Pointer Resolution
 
-To guarantee production-grade stability and complete continuity across complex monorepos, PG-Git underwent a thorough architectural audit and reliability overhaul:
+To guarantee production-grade stability and complete continuity across complex monorepos, Krusch-Git underwent a thorough architectural audit and reliability overhaul:
 
-1. **Deterministic Pointer Resolution**: In standard `'pointer'` storage mode (used to keep the database lightweight), file content is stored as `NULL` in PostgreSQL. We introduced a dynamic resolver inside `server/git-engine.js` that maps relative blob paths to the local filesystem monorepo root. This automatically streams raw file contents from disk on demand, resolving previous `null` value crashes on the Express `/api/blobs/:id` route and `pg_git_read_blob` MCP tool.
-2. **Safe Semantic Search Previews**: Standard semantic search tool calls throw TypeErrors if they attempt to stringify nullable database columns. PG-Git now safely extracts the pre-compiled `summary` column (generated using `qwen2.5-coder:14b` inline summaries) to serve as the context preview.
+1. **Deterministic Pointer Resolution**: In standard `'pointer'` storage mode (used to keep the database lightweight), file content is stored as `NULL` in PostgreSQL. We introduced a dynamic resolver inside `server/git-engine.js` that maps relative blob paths to the local filesystem monorepo root. This automatically streams raw file contents from disk on demand, resolving previous `null` value crashes on the Express `/api/blobs/:id` route and `krusch_git_read_blob` MCP tool.
+2. **Safe Semantic Search Previews**: Standard semantic search tool calls throw TypeErrors if they attempt to stringify nullable database columns. Krusch-Git now safely extracts the pre-compiled `summary` column (generated using `qwen2.5-coder:14b` inline summaries) to serve as the context preview.
 3. **Starvation-Proof Queue Management**: The fleet priority queue (`PriorityQueue.process`) inside `lib/llm-queue.js` is secured using a strict `try ... finally` block. This guarantees that concurrent slots are cleanly released (`this.active--`) under all task outcomes, preventing memory and slot leaks that would otherwise block multi-agent swarm operations.
 4. **Fidelity-Preserved Embedding Backfills**: Upgraded `backfill_embeddings.js` to automatically resolve local disk paths when processing pointer-mode blobs. This enables the embedding backfill process to compute full-fidelity, chunked centroid embeddings from the original code rather than falling back to lossy, shortened summary snippets.
 
@@ -48,7 +48,7 @@ ollama pull bge-large
 ```
 
 **1. Clone & Migrate Database**
-You will need a running PostgreSQL instance with `pgvector` enabled (or local SQLite adapter).
+You will need a running PostgreSQL instance with `pgvector` enabled.
 ```bash
 git clone https://github.com/kruschdev/krusch-git.git
 cd krusch-git
@@ -78,7 +78,7 @@ Add Krusch-Git to your agent/IDE configuration (e.g., `mcp_config.json`):
       "command": "npx",
       "args": ["-y", "krusch-git"],
       "env": {
-        "PG_CONNECTION_STRING": "postgres://user:pass@localhost:5434/kruschdb",
+        "DATABASE_URL": "postgresql://kdcode:password@localhost:5432/kdcode",
         "OLLAMA_URL": "http://localhost:11434",
         "EMBED_MODEL": "bge-large"
       }
@@ -87,7 +87,7 @@ Add Krusch-Git to your agent/IDE configuration (e.g., `mcp_config.json`):
 }
 ```
 
-*(Note: `pg-git-mcp` remains available as an alias command for backward compatibility).*
+*(Note: Legacy `pg-git-mcp` CLI and `pg_git_*` tool calls remain available as aliases for backward compatibility).*
 
 **4. Start the Web UI (Optional)**
 Krusch-Git includes a sleek, dual-pane IDE interface for browsing your semantic repositories.
@@ -121,19 +121,19 @@ Speak to your IDE agent normally. It will use the standalone MCP tools to interf
 
 **Example 1: Finding specific logic**
 > **You:** "Where do we handle the temporal decay for the memory MCP?"
-> **Agent:** *[Calls `pg_git_semantic_search`]* "I found the logic in `server/git-engine.js`. It uses the `exp(-0.01 * age_in_days)` formula in `searchBlobs()`."
+> **Agent:** *[Calls `krusch_git_semantic_search`]* "I found the logic in `server/git-engine.js`. It uses the `exp(-0.01 * age_in_days)` formula in `searchBlobs()`."
 
 **Example 2: Reading a repository tree**
-> **You:** "What is the folder structure for the pg-git project?"
-> **Agent:** *[Calls `pg_git_read_tree`]* "Here is the root directory structure..."
+> **You:** "What is the folder structure for the project?"
+> **Agent:** *[Calls `krusch_git_read_tree`]* "Here is the root directory structure..."
 
 **Example 3: Filtering by project**
 > **You:** "Search for authentication logic in the pocket-lawyer project only."
-> **Agent:** *[Calls `pg_git_semantic_search` with `project: 'pocket-lawyer'`]* "Found 3 matches in the auth module..."
+> **Agent:** *[Calls `krusch_git_semantic_search` with `project: 'pocket-lawyer'`]* "Found 3 matches in the auth module..."
 
 ### How Does Temporal Decay Work?
 
-When calling `pg_git_semantic_search`, PG-Git returns the highest cosine-similarity matches. However, it applies **Exponential Temporal Decay** based on the blob's `last_seen_at` timestamp:
+When calling `krusch_git_semantic_search`, Krusch-Git returns the highest cosine-similarity matches. However, it applies **Exponential Temporal Decay** based on the blob's `last_seen_at` timestamp:
 
 ```
 score = cosine_similarity × exp(-0.01 × age_in_days)
@@ -145,7 +145,7 @@ If you have two very similar pieces of code, the *newer* one will have a signifi
 
 ## 🤖 The Autonomous Agent Workflow
 
-You can integrate PG-Git into your agentic workflow to ensure your semantic memory is always up to date. 
+You can integrate Krusch-Git into your agentic workflow to ensure your semantic memory is always up to date. 
 
 ### Snapshot (Single Project)
 Whenever you step away from a task, tell your agent to run the snapshot script. The agent will autonomously:
@@ -165,7 +165,7 @@ npm run sync-all
 ```
 
 ### External Documentation Sync
-PG-Git can ingest external documentation (e.g., `llms.txt` manifests) for hallucination-free framework knowledge:
+Krusch-Git can ingest external documentation (e.g., `llms.txt` manifests) for hallucination-free framework knowledge:
 
 ```bash
 node scripts/sync_external_docs.js
@@ -176,7 +176,7 @@ node scripts/sync_external_docs.js
 ## 📂 Project Structure
 
 ```
-pg-git/
+krusch-git/
 ├── server/
 │   ├── index.js              # Express API + Web UI server
 │   ├── mcp.js                # Standalone MCP server (StdioServerTransport)
@@ -188,6 +188,7 @@ pg-git/
 │   ├── create-db.js          # Database creation helper
 │   └── list-dbs.js           # List available databases
 ├── lib/
+│   ├── ast-chunker.js        # AST symbol extraction and dependency edge builder
 │   └── embedding.js          # Shared Ollama embedding client with fleet load balancing
 ├── scripts/
 │   ├── sync_to_pg.js         # Snapshot a single project into PostgreSQL
@@ -204,9 +205,13 @@ pg-git/
 │   └── external_docs.json    # External documentation manifest
 ├── config.js                 # Unified configuration (env + config.json merge)
 ├── assets/                   # Banner and social preview images
+├── docs/
+│   └── TOOL_REFERENCE.md     # Authoritative MCP tool reference and schemas
+├── tests/                    # Contract and algorithmic test suites
 ├── Dockerfile                # Multi-stage production build
 ├── docker-compose.yml        # Container orchestration
 ├── AGENTS.md                 # Agent context rules for AI IDEs
+├── LICENSE                   # MIT License
 └── spec.md                   # Original project specification
 ```
 
@@ -214,22 +219,23 @@ pg-git/
 
 ## 🛠️ Configuration & Environment Variables
 
-PG-Git uses a layered configuration system: environment variables override `config.json`, which overrides built-in defaults.
+Krusch-Git uses a layered configuration system: environment variables override `config.json`, which overrides built-in defaults.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | Express server port | `4890` |
+| `DATABASE_URL` / `PG_CONNECTION_STRING` | PostgreSQL connection string | `postgresql://kdcode:password@localhost:5432/kdcode` |
 | `DB_HOST` | PostgreSQL Host address | `localhost` |
-| `DB_PORT` | PostgreSQL Port | `5434` |
-| `DB_NAME` | Database Name | `postgres` |
-| `DB_USER` | Database User | `postgres` |
-| `DB_PASSWORD` | Database Password | *(empty)* |
+| `DB_PORT` | PostgreSQL Port | `5432` |
+| `DB_NAME` | Database Name | `kdcode` |
+| `DB_USER` | Database User | `kdcode` |
+| `DB_PASSWORD` | Database Password | `password` |
 | `OLLAMA_URL` | The endpoint for your local Ollama instance | `http://localhost:11434` |
 | `EMBED_MODEL`| The Ollama text-embedding model to use | `bge-large` |
 
 ### Database Schema (v1.1.0)
 
-PG-Git's PostgreSQL schema maps Git objects and code structure directly into SQL tables:
+Krusch-Git's PostgreSQL schema maps Git objects and code structure directly into SQL tables:
 
 - **`repositories`** — Project registries
 - **`commits`** — SHA-1 identified commit objects with tree and parent references
@@ -270,4 +276,4 @@ When running Krusch-Git as an MCP server (`npx krusch-git` or `node server/mcp.j
 | **[Krusch Git](https://github.com/kruschdev/krusch-git)** | Codebase AST, symbol search, Git DAG indexing, and dependency graphs |
 
 ## License
-ISC License. Created by [kruschdev](https://github.com/kruschdev).
+MIT License. Created by [kruschdev](https://github.com/kruschdev).

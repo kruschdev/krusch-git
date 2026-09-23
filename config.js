@@ -44,7 +44,8 @@ function parseDatabaseUrl(urlStr) {
     }
 }
 
-const dbUrlConfig = process.env.DATABASE_URL ? parseDatabaseUrl(process.env.DATABASE_URL) : {};
+const rawDbUrl = process.env.DATABASE_URL || process.env.PG_CONNECTION_STRING;
+const dbUrlConfig = rawDbUrl ? parseDatabaseUrl(rawDbUrl) : {};
 
 export const config = {
     ...baseConfig,

@@ -1,7 +1,7 @@
 {
   "name": "krusch-git",
   "version": "1.2.0",
-  "description": "Intelligent Git DAG, AST chunking, and codebase symbol search engine for AI coding agents. SQLite & PostgreSQL compatible.",
+  "description": "Intelligent Git DAG, AST chunking, and codebase symbol search engine for AI coding agents. PostgreSQL + pgvector.",
   "main": "server/index.js",
   "bin": {
     "krusch-git": "bin/cli.js",
@@ -21,19 +21,31 @@
     "lib",
     "scripts",
     "client/dist",
-    "config.js"
+    "config.js",
+    "docs",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
-    "test": "node --env-file=.env --test tests/*.test.js",
+    "test": "node --test tests/*.test.js",
     "dev": "node server/index.js & cd client && npm run dev",
     "mcp": "node server/mcp.js",
     "snapshot": "node scripts/sync_to_pg.js",
     "sync-all": "node scripts/sync_all_projects.js",
     "import": "node scripts/import_github.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "git",
+    "git-dag",
+    "ast-chunking",
+    "code-search",
+    "symbol-search",
+    "coding-agents"
+  ],
+  "author": "kruschdev",
+  "license": "MIT",
   "type": "module",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
