@@ -50,6 +50,31 @@ test('MCP Server: exposes canonical krusch_git_* tools and aliases pg_git_*', as
         assert.ok(!resLegacy.isError, 'Legacy aliased tool call should succeed');
         assert.deepStrictEqual(resLegacy.content, resCanonical.content, 'Alias should produce identical output');
 
+        // 4. Test AGENTS.md calling convention with { repo, query } on search_symbols
+        const resSymbols = await client.callTool({
+            name: 'krusch_git_search_symbols',
+            arguments: { repo: 'krusch-git', query: 'searchBlobs' }
+        });
+        assert.ok(resSymbols.content && resSymbols.content.length > 0);
+        assert.ok(!resSymbols.isError, 'Symbol search with repo parameter should succeed');
+
+        // 5. Test AGENTS.md calling convention with { repo, symbol } on dependency_graph
+        const resDep = await client.callTool({
+            name: 'krusch_git_dependency_graph',
+            arguments: { repo: 'krusch-git', symbol: 'searchBlobs' }
+        });
+        assert.ok(resDep.content && resDep.content.length > 0);
+        assert.ok(!resDep.isError, 'Dependency graph by symbol should succeed');
+
+        // 6. Test AGENTS.md calling convention with { repo, file_path } on read_blob
+        const resBlob = await client.callTool({
+            name: 'krusch_git_read_blob',
+            arguments: { repo: 'krusch-git', file_path: 'server/git-engine.js' }
+        });
+        assert.ok(resBlob.content && resBlob.content.length > 0);
+        assert.ok(!resBlob.isError, 'Read blob by file_path should succeed');
+        assert.ok(resBlob.content[0].text.includes('searchBlobs'), 'Blob text should contain searchBlobs');
+
     } finally {
         await client.close();
         await server.close();
