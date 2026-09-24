@@ -5,6 +5,10 @@ A persistent Git DAG indexer, AST chunker, and semantic codebase retrieval engin
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Node](https://img.shields.io/badge/Node.js-22+-green.svg)
 ![Storage](https://img.shields.io/badge/Storage-PostgreSQL%20%2B%20pgvector-lightgrey.svg)
+[![Article: Architecture Deep Dive](https://img.shields.io/badge/Article-Architecture%20Deep%20Dive-cyan.svg)](https://krusch.dev/articles/krusch-git-architecture.html)
+[![Docs: What Makes It Special](https://img.shields.io/badge/Docs-What%20Makes%20It%20Special-purple.svg)](docs/WHAT_MAKES_IT_SPECIAL.md)
+
+> 📖 **Read the Systems Deep Dive**: Check out the published architecture essay [**krusch-git: Git DAG Indexing, Relational AST Symbols, and Hybrid Recency Search for AI Coding Agents**](https://krusch.dev/articles/krusch-git-architecture.html) on krusch.dev, or the local companion guide in [`docs/WHAT_MAKES_IT_SPECIAL.md`](docs/WHAT_MAKES_IT_SPECIAL.md).
 
 ## 🧠 Why Krusch-Git?
 
