@@ -1,6 +1,6 @@
 # krusch-git — Agent Context & Tool Protocol
 
-> **Package**: `krusch-git` (v1.2.0)  
+> **Package**: `krusch-git` (v1.2.1)  
 > **Role**: Git DAG, AST Chunking & Symbol Dependency Exploration Engine  
 > **Transports**: Model Context Protocol (stdio) via `server/mcp.js`
 
@@ -28,8 +28,8 @@ When coding agents need to explore code structure, locate functions/classes, or 
 
 ### 3. 📂 Git DAG Tree & Blob Inspection
 * **List Indexed Repos**: `krusch_git_list_repos({})`
-* **Read Tree Hierarchy**: `krusch_git_read_tree({ repository_id: <id>, tree_id: "<sha>" })`
-* **Read Blob Content**: `krusch_git_read_blob({ blob_id: <id> })`
+* **Read Tree Hierarchy**: `krusch_git_read_tree({ repo: "<repo_name>", tree_sha: "HEAD" })` (or `{ repository_id, tree_id }`)
+* **Read Blob Content**: `krusch_git_read_blob({ repo: "<repo_name>", file_path: "<relative_path>" })` (or `{ blob_id }`)
 
 ---
 
