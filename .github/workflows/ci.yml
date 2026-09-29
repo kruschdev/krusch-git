@@ -1,0 +1,70 @@
+name: KruschGit CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test Suite (Node 22 + pgvector)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: krusch_git_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/krusch_git_test
+        run: node db/migrate.js
+
+      - name: Run Test Suite
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/krusch_git_test
+        run: npm test
+
+      - name: Instant Failure Push Notification
+        if: failure()
+        run: |
+          curl -s -X POST \
+            -H "Title: 🚨 CI Failure: ${{ github.repository }} (Node 22 + pgvector)" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light,x" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "Run #${{ github.run_number }} failed on ${{ github.ref_name }}. Commit: ${{ github.sha }} by ${{ github.actor }}." \
+            https://ntfy.sh/krusch-ci-alerts || true
+
+      - name: Dispatch Webhook Alert (Optional)
+        if: failure() && env.CI_WEBHOOK != ''
+        env:
+          CI_WEBHOOK: ${{ secrets.CI_FAILURE_WEBHOOK }}
+        run: |
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"content\": \"🚨 **CI Failure**: [${{ github.repository }}#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed on \`${{ github.ref_name }}\` (Commit: \`${{ github.sha }}\`)\"}" \
+            "$CI_WEBHOOK" || true
