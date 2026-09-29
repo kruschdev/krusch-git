@@ -74,13 +74,16 @@ export async function resolveBlobContent(blob) {
             }
         }
         
-        if (!projectName || !blob.file_path) {
+        const safeProject = path.basename(String(projectName).trim());
+        const cleanFilePath = String(blob.file_path).trim().replace(/^[/\\]+/, '');
+        if (!safeProject || safeProject === '.' || safeProject === '..') {
             return null;
         }
-        
-        const absolutePath = path.resolve(PROJECTS_ROOT, projectName, blob.file_path);
-        // Verify path is safe and inside PROJECTS_ROOT to prevent path traversal
-        if (!absolutePath.startsWith(PROJECTS_ROOT)) {
+
+        const absolutePath = path.resolve(PROJECTS_ROOT, safeProject, cleanFilePath);
+        const rel = path.relative(PROJECTS_ROOT, absolutePath);
+        // Verify path is safe and strictly inside PROJECTS_ROOT
+        if (rel.startsWith('..') || path.isAbsolute(rel) || rel === '') {
             throw new Error(`Path traversal detected: ${absolutePath}`);
         }
         

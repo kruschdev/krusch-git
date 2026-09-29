@@ -33,16 +33,26 @@ const PROJECTS_ROOT = path.resolve(__dirname, '..', '..');
 // Helper to resolve repository name/alias to integer ID
 async function resolveRepoId(repoParam, repoIdParam) {
     if (repoIdParam !== undefined && repoIdParam !== null) {
-        return Number(repoIdParam);
+        const parsed = Number(repoIdParam);
+        if (Number.isInteger(parsed) && parsed > 0) {
+            return parsed;
+        }
+        return null;
     }
     if (!repoParam) return null;
     const name = String(repoParam).trim();
+    if (!name) return null;
     const repoRes = await pool.query(
         `SELECT id FROM repositories WHERE name = $1 OR name = $2 OR name = $3 LIMIT 1`,
         [name, name === 'krusch-git' ? 'pg-git' : name, name.replace(/^krusch-/, '')]
     );
     if (repoRes.rows.length > 0) {
         return repoRes.rows[0].id;
+    }
+    const num = Number(name);
+    if (Number.isInteger(num) && num > 0) {
+        const idRes = await pool.query(`SELECT id FROM repositories WHERE id = $1 LIMIT 1`, [num]);
+        if (idRes.rows.length > 0) return idRes.rows[0].id;
     }
     return null;
 }
@@ -182,10 +192,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             };
         } else if (name === "krusch_git_read_tree") {
             const repoParam = args.repo || args.project;
-            let resolvedRepoId = args.repository_id || null;
-            if (!resolvedRepoId && repoParam) {
-                resolvedRepoId = await resolveRepoId(repoParam);
-            }
+            const resolvedRepoId = await resolveRepoId(repoParam, args.repository_id);
             if (!resolvedRepoId) {
                 throw new McpError(ErrorCode.InvalidParams, "Either 'repo' (name) or 'repository_id' is required.");
             }
@@ -207,14 +214,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return { content: [{ type: "text", text: `Tree contents for ${targetTree} (repo: ${repoParam || resolvedRepoId}):\n\n${output}` }] };
 
         } else if (name === "krusch_git_read_blob") {
-            const { blob_id, file_path, repo, project } = args;
+            const { blob_id, file_path, repo, project, repository_id } = args;
+            if (!blob_id && !file_path) {
+                throw new McpError(ErrorCode.InvalidParams, "Either 'blob_id' or 'file_path' is required.");
+            }
             let blob = null;
 
             if (blob_id) {
                 blob = await getBlob(blob_id);
             } else if (file_path) {
                 const repoParam = repo || project;
-                const resolvedRepoId = repoParam ? await resolveRepoId(repoParam) : null;
+                const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
                 const blobRes = await pool.query(`
                     SELECT b.*, r.name AS project 
                     FROM blobs b
@@ -233,15 +243,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!blob && file_path && (repo || project)) {
                 const rawProject = String(repo || project).trim();
                 const safeProject = path.basename(rawProject);
-                const safeFilePath = path.normalize(String(file_path).trim()).replace(/^(\.\.(\/|\\|$))+/, '');
+                const cleanFilePath = String(file_path).trim().replace(/^[/\\]+/, '');
                 
-                const targetPath = path.resolve(PROJECTS_ROOT, safeProject, safeFilePath);
-                // Strict path containment: must remain inside PROJECTS_ROOT
-                if (targetPath.startsWith(PROJECTS_ROOT)) {
-                    try {
-                        const content = await fs.readFile(targetPath, 'utf-8');
-                        return { content: [{ type: "text", text: content }] };
-                    } catch (_) {}
+                if (safeProject && safeProject !== '.' && safeProject !== '..') {
+                    const targetPath = path.resolve(PROJECTS_ROOT, safeProject, cleanFilePath);
+                    const rel = path.relative(PROJECTS_ROOT, targetPath);
+                    // Strict path containment: must remain inside PROJECTS_ROOT
+                    if (!rel.startsWith('..') && !path.isAbsolute(rel) && rel !== '') {
+                        try {
+                            const buffer = await fs.readFile(targetPath);
+                            if (buffer.subarray(0, 1024).includes(0)) {
+                                return { content: [{ type: "text", text: `[Binary file: ${path.basename(cleanFilePath)} (${buffer.length} bytes)]` }] };
+                            }
+                            let textContent = buffer.toString('utf-8');
+                            if (textContent.length > 500000) {
+                                textContent = textContent.slice(0, 500000) + `\n\n... [Content truncated: file size (${buffer.length} bytes) exceeds limit]`;
+                            }
+                            return { content: [{ type: "text", text: textContent }] };
+                        } catch (_) {}
+                    }
                 }
             }
 
@@ -253,7 +273,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!buffer) {
                 throw new McpError(ErrorCode.InternalError, `Failed to resolve content for blob ${blob.id || file_path}.`);
             }
-            const textContent = buffer.toString('utf-8');
+            if (buffer.subarray(0, 1024).includes(0)) {
+                return { content: [{ type: "text", text: `[Binary file: ${blob.file_name || file_path} (${buffer.length} bytes)]` }] };
+            }
+            let textContent = buffer.toString('utf-8');
+            if (textContent.length > 500000) {
+                textContent = textContent.slice(0, 500000) + `\n\n... [Content truncated: file size (${buffer.length} bytes) exceeds limit]`;
+            }
             return { content: [{ type: "text", text: textContent }] };
             
         } else if (name === "krusch_git_semantic_search") {
@@ -265,10 +291,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const limit = Math.min(Math.max(1, Number(args.limit) || 5), 50);
             
             const repoParam = repo || project;
-            let resolvedRepoId = repository_id || null;
-            if (repoParam && !resolvedRepoId) {
-                resolvedRepoId = await resolveRepoId(repoParam);
-            }
+            const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
             
             let vector = null;
             if (search_type !== "keyword") {
@@ -303,10 +326,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const limit = Math.min(Math.max(1, Number(args.limit) || 10), 100);
             
             const repoParam = repo || project;
-            let resolvedRepoId = repository_id || null;
-            if (repoParam && !resolvedRepoId) {
-                resolvedRepoId = await resolveRepoId(repoParam);
-            }
+            const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
 
             const symbols = await searchSymbols(searchQuery, limit, resolvedRepoId, { symbol_type });
             if (symbols.length === 0) {
@@ -326,14 +346,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return { content: [{ type: "text", text: output }] };
 
         } else if (name === "krusch_git_file_symbols") {
-            const { blob_id, file_path, repo, project } = args;
+            const { blob_id, file_path, repo, project, repository_id } = args;
+            if (!blob_id && !file_path) {
+                throw new McpError(ErrorCode.InvalidParams, "Either 'file_path' or 'blob_id' is required.");
+            }
             let symbols = [];
 
             if (blob_id) {
                 symbols = await getSymbolsForBlob(blob_id);
             } else if (file_path) {
                 const repoParam = repo || project;
-                const resolvedRepoId = repoParam ? await resolveRepoId(repoParam) : null;
+                const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
                 const symRes = await pool.query(`
                     SELECT s.*, r.name AS project
                     FROM code_symbols s
@@ -359,10 +382,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { file_path, symbol, repository_id, project, repo } = args;
 
             const repoParam = repo || project;
-            let resolvedRepoId = repository_id || null;
-            if (repoParam && !resolvedRepoId) {
-                resolvedRepoId = await resolveRepoId(repoParam);
-            }
+            let resolvedRepoId = await resolveRepoId(repoParam, repository_id);
 
             let targetFilePath = file_path;
             let targetSymbol = symbol;

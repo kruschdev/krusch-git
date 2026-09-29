@@ -75,6 +75,39 @@ test('MCP Server: exposes canonical krusch_git_* tools and aliases pg_git_*', as
         assert.ok(!resBlob.isError, 'Read blob by file_path should succeed');
         assert.ok(resBlob.content[0].text.includes('searchBlobs'), 'Blob text should contain searchBlobs');
 
+        // 7. Test read_blob leading slash handling
+        const resBlobSlash = await client.callTool({
+            name: 'krusch_git_read_blob',
+            arguments: { repo: 'krusch-git', file_path: '/server/git-engine.js' }
+        });
+        assert.ok(resBlobSlash.content && resBlobSlash.content.length > 0);
+        assert.ok(!resBlobSlash.isError, 'Read blob with leading slash should succeed');
+        assert.ok(resBlobSlash.content[0].text.includes('searchBlobs'));
+
+        // 8. Test read_blob missing params rejection
+        await assert.rejects(async () => {
+            await client.callTool({
+                name: 'krusch_git_read_blob',
+                arguments: {}
+            });
+        }, /Either 'blob_id' or 'file_path' is required/);
+
+        // 9. Test file_symbols missing params rejection
+        await assert.rejects(async () => {
+            await client.callTool({
+                name: 'krusch_git_file_symbols',
+                arguments: {}
+            });
+        }, /Either 'file_path' or 'blob_id' is required/);
+
+        // 10. Test read_tree invalid non-numeric repository_id rejection
+        await assert.rejects(async () => {
+            await client.callTool({
+                name: 'krusch_git_read_tree',
+                arguments: { repository_id: 'not-a-number' }
+            });
+        }, /Either 'repo' \(name\) or 'repository_id' is required/);
+
     } finally {
         await client.close();
         await server.close();
