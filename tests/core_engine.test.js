@@ -125,3 +125,233 @@ export function createRouter() {
     const funcSym = symbols.find(s => s.type === 'function' && s.name === 'createRouter');
     assert.ok(funcSym, 'createRouter function must be extracted');
 });
+
+test('AST Chunker: TypeScript interfaces, type aliases, and enums', () => {
+    const tsFixture = `
+import type { Request, Response } from 'express';
+
+export interface UserSession {
+    userId: string;
+    token: string;
+    roles: string[];
+}
+
+export type AuthStatus = 'authenticated' | 'anonymous' | 'expired';
+
+export enum RoleLevel {
+    GUEST = 0,
+    USER = 1,
+    ADMIN = 2,
+}
+`;
+
+    const { symbols, imports } = extractSymbolsAndImports(tsFixture, 'types/auth.ts');
+
+    assert.ok(imports.length >= 1);
+    assert.strictEqual(imports[0].targetPath, 'express');
+    assert.ok(imports[0].symbols.includes('Request'));
+    assert.ok(imports[0].symbols.includes('Response'));
+
+    // Interface check
+    const iface = symbols.find(s => s.name === 'UserSession');
+    assert.ok(iface, 'Should extract UserSession interface');
+    assert.strictEqual(iface.symbol_type, 'type');
+    assert.ok(iface.startLine > 0);
+    assert.ok(iface.endLine >= iface.startLine);
+
+    // Type alias check
+    const typeAlias = symbols.find(s => s.name === 'AuthStatus');
+    assert.ok(typeAlias, 'Should extract AuthStatus type alias');
+    assert.strictEqual(typeAlias.symbol_type, 'type');
+
+    // Enum check
+    const enumSym = symbols.find(s => s.name === 'RoleLevel');
+    assert.ok(enumSym, 'Should extract RoleLevel enum');
+    assert.strictEqual(enumSym.symbol_type, 'type');
+});
+
+test('AST Chunker: Python multiline imports, routes (FastAPI & Flask), and multiline defs', () => {
+    const pyFixture = `
+from typing import (
+    List,
+    Optional,
+    Dict as DictType
+)
+import os, sys
+
+@app.get("/api/v1/items/{item_id}")
+async def get_item(
+    item_id: int,
+    include_metadata: bool = False
+) -> DictType:
+    return {"id": item_id}
+
+@bp.route("/auth/login", methods=["POST", "GET"])
+def login():
+    return "ok"
+`;
+
+    const { symbols, imports } = extractSymbolsAndImports(pyFixture, 'api/routes.py');
+
+    // Imports check
+    const typingImport = imports.find(i => i.targetPath === 'typing');
+    assert.ok(typingImport, 'Should extract multiline typing import');
+    assert.ok(typingImport.symbols.includes('List'));
+    assert.ok(typingImport.symbols.includes('Optional'));
+    assert.ok(typingImport.symbols.includes('Dict'));
+
+    // FastAPI route check
+    const fastapiRoute = symbols.find(s => s.type === 'route' && s.name === 'GET /api/v1/items/{item_id}');
+    assert.ok(fastapiRoute, 'Should extract FastAPI GET route symbol');
+    assert.strictEqual(fastapiRoute.symbol_type, 'route');
+    assert.ok(fastapiRoute.signature.includes('@app.get'));
+
+    // Flask route check (multiple methods in decorator)
+    const flaskPost = symbols.find(s => s.type === 'route' && s.name === 'POST /auth/login');
+    const flaskGet = symbols.find(s => s.type === 'route' && s.name === 'GET /auth/login');
+    assert.ok(flaskPost, 'Should extract Flask POST route symbol');
+    assert.ok(flaskGet, 'Should extract Flask GET route symbol');
+
+    // Multiline function def check
+    const fnSym = symbols.find(s => s.type === 'function' && s.name === 'get_item');
+    assert.ok(fnSym, 'Should extract multiline get_item function');
+    assert.ok(fnSym.endLine >= fnSym.startLine + 4);
+});
+
+test('AST Chunker: Go functions, receiver methods, structs, and imports with exact brace blocks', () => {
+    const goFixture = `
+package server
+
+import (
+    "fmt"
+    "net/http"
+    gin "github.com/gin-gonic/gin"
+)
+
+type ServerConfig struct {
+    Port int
+    Host string
+}
+
+func (s *ServerConfig) Start() error {
+    fmt.Printf("Starting on %d", s.Port)
+    return nil
+}
+
+func NewConfig(port int) *ServerConfig {
+    return &ServerConfig{
+        Port: port,
+        Host: "127.0.0.1",
+    }
+}
+`;
+
+    const { symbols, imports } = extractSymbolsAndImports(goFixture, 'pkg/server.go');
+
+    // Imports check
+    assert.ok(imports.some(i => i.targetPath === 'fmt'));
+    assert.ok(imports.some(i => i.targetPath === 'net/http'));
+    assert.ok(imports.some(i => i.targetPath === 'github.com/gin-gonic/gin'));
+
+    // Struct check
+    const structSym = symbols.find(s => s.name === 'ServerConfig');
+    assert.ok(structSym, 'Should extract ServerConfig struct');
+    assert.strictEqual(structSym.symbol_type, 'type');
+    assert.strictEqual(structSym.startLine, 10);
+    assert.strictEqual(structSym.endLine, 13);
+
+    // Method with receiver check
+    const methodSym = symbols.find(s => s.name === 'ServerConfig.Start');
+    assert.ok(methodSym, 'Should extract receiver method ServerConfig.Start');
+    assert.strictEqual(methodSym.symbol_type, 'method');
+    assert.strictEqual(methodSym.startLine, 15);
+    assert.strictEqual(methodSym.endLine, 18);
+
+    // Function check
+    const funcSym = symbols.find(s => s.name === 'NewConfig');
+    assert.ok(funcSym, 'Should extract NewConfig function');
+    assert.strictEqual(funcSym.symbol_type, 'function');
+    assert.strictEqual(funcSym.startLine, 20);
+    assert.strictEqual(funcSym.endLine, 25);
+});
+
+test('AST Chunker: Rust functions, structs, enums, traits, and use imports with exact brace blocks', () => {
+    const rustFixture = `
+use std::sync::Arc;
+use crate::models::{User, Account};
+
+pub struct ClusterConfig {
+    pub node_id: u64,
+}
+
+pub trait WorkerPool {
+    fn process_task(&self, task_id: &str) -> bool;
+}
+
+pub async fn start_worker(cfg: ClusterConfig) -> Arc<ClusterConfig> {
+    println!("Node: {}", cfg.node_id);
+    Arc::new(cfg)
+}
+`;
+
+    const { symbols, imports } = extractSymbolsAndImports(rustFixture, 'src/worker.rs');
+
+    // Imports check
+    assert.ok(imports.some(i => i.targetPath === 'std::sync::Arc'));
+    const modelsImport = imports.find(i => i.targetPath === 'crate::models');
+    assert.ok(modelsImport);
+    assert.ok(modelsImport.symbols.includes('User'));
+    assert.ok(modelsImport.symbols.includes('Account'));
+
+    // Struct check
+    const structSym = symbols.find(s => s.name === 'ClusterConfig');
+    assert.ok(structSym, 'Should extract ClusterConfig struct');
+    assert.strictEqual(structSym.symbol_type, 'type');
+    assert.strictEqual(structSym.startLine, 5);
+    assert.strictEqual(structSym.endLine, 7);
+
+    // Trait check
+    const traitSym = symbols.find(s => s.name === 'WorkerPool');
+    assert.ok(traitSym, 'Should extract WorkerPool trait');
+    assert.strictEqual(traitSym.symbol_type, 'type');
+    assert.strictEqual(traitSym.startLine, 9);
+    assert.strictEqual(traitSym.endLine, 11);
+
+    // Function check
+    const funcSym = symbols.find(s => s.name === 'start_worker');
+    assert.ok(funcSym, 'Should extract start_worker async function');
+    assert.strictEqual(funcSym.symbol_type, 'function');
+    assert.strictEqual(funcSym.startLine, 13);
+    assert.strictEqual(funcSym.endLine, 16);
+});
+
+test('AST Chunker: Shell functions with exact brace boundaries', () => {
+    const shFixture = `
+#!/usr/bin/env bash
+
+# Deploy cluster service
+deploy_cluster() {
+    echo "Starting cluster deployment..."
+    systemctl restart dbos
+    return 0
+}
+
+function stop_cluster {
+    echo "Stopping..."
+    exit 0
+}
+`;
+
+    const { symbols } = extractSymbolsAndImports(shFixture, 'scripts/deploy.sh');
+
+    const fn1 = symbols.find(s => s.name === 'deploy_cluster');
+    assert.ok(fn1, 'Should extract deploy_cluster shell function');
+    assert.strictEqual(fn1.startLine, 5);
+    assert.strictEqual(fn1.endLine, 9);
+
+    const fn2 = symbols.find(s => s.name === 'stop_cluster');
+    assert.ok(fn2, 'Should extract stop_cluster shell function');
+    assert.strictEqual(fn2.startLine, 11);
+    assert.strictEqual(fn2.endLine, 14);
+});
+

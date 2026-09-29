@@ -1,6 +1,7 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert';
 import { server } from '../server/mcp.js';
+import { pool } from '../db/pool.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
@@ -112,4 +113,8 @@ test('MCP Server: exposes canonical krusch_git_* tools and aliases pg_git_*', as
         await client.close();
         await server.close();
     }
+});
+
+after(async () => {
+    await pool.end();
 });

@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert';
 import { extractSymbolsAndImports } from '../lib/ast-chunker.js';
 import { 
@@ -9,7 +9,7 @@ import {
     createRepository,
     getRepositories
 } from '../server/git-engine.js';
-import { query } from '../db/pool.js';
+import { pool, query } from '../db/pool.js';
 
 test('AST Chunker: extracts JavaScript and TypeScript symbols & imports', () => {
     const code = `
@@ -212,4 +212,8 @@ test('Database Schema & Search: hybrid RRF, keyword, and backward compatibility'
         // Cleanup test repository and cascaded records
         await query(`DELETE FROM repositories WHERE id = $1`, [repo.id]);
     }
+});
+
+after(async () => {
+    await pool.end();
 });
