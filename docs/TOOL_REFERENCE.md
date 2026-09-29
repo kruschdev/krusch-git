@@ -24,7 +24,7 @@ List all available Git repositories indexed in PostgreSQL.
     {
       "id": 1,
       "name": "krusch-context-mcp",
-      "path": "/home/krusch/homelab/projects/krusch-context-mcp",
+      "path": "/path/to/krusch-context-mcp",
       "head_commit": "0c7ec1f",
       "last_indexed_at": "2026-09-23T22:43:55.000Z"
     }
