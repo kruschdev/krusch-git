@@ -231,14 +231,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             // Direct filesystem fallback if unindexed or pointer resolution needs local disk
             if (!blob && file_path && (repo || project)) {
-                const projectName = repo || project;
-                const candidatePaths = [
-                    path.resolve(PROJECTS_ROOT, projectName, file_path),
-                    path.resolve(PROJECTS_ROOT, '..', projectName, file_path)
-                ];
-                for (const p of candidatePaths) {
+                const rawProject = String(repo || project).trim();
+                const safeProject = path.basename(rawProject);
+                const safeFilePath = path.normalize(String(file_path).trim()).replace(/^(\.\.(\/|\\|$))+/, '');
+                
+                const targetPath = path.resolve(PROJECTS_ROOT, safeProject, safeFilePath);
+                // Strict path containment: must remain inside PROJECTS_ROOT
+                if (targetPath.startsWith(PROJECTS_ROOT)) {
                     try {
-                        const content = await fs.readFile(p, 'utf-8');
+                        const content = await fs.readFile(targetPath, 'utf-8');
                         return { content: [{ type: "text", text: content }] };
                     } catch (_) {}
                 }
@@ -256,7 +257,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return { content: [{ type: "text", text: textContent }] };
             
         } else if (name === "krusch_git_semantic_search") {
-            const { query: searchQuery, limit = 5, repository_id, project, repo, search_type = "hybrid" } = args;
+            const { repository_id, project, repo, search_type = "hybrid" } = args;
+            const searchQuery = String(args.query || '').trim();
+            if (!searchQuery) {
+                throw new McpError(ErrorCode.InvalidParams, "Parameter 'query' cannot be empty.");
+            }
+            const limit = Math.min(Math.max(1, Number(args.limit) || 5), 50);
             
             const repoParam = repo || project;
             let resolvedRepoId = repository_id || null;
@@ -289,7 +295,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return { content: [{ type: "text", text: output }] };
 
         } else if (name === "krusch_git_search_symbols") {
-            const { query: searchQuery, limit = 10, repository_id, project, repo, symbol_type } = args;
+            const { repository_id, project, repo, symbol_type } = args;
+            const searchQuery = String(args.query || '').trim();
+            if (!searchQuery) {
+                throw new McpError(ErrorCode.InvalidParams, "Parameter 'query' cannot be empty.");
+            }
+            const limit = Math.min(Math.max(1, Number(args.limit) || 10), 100);
             
             const repoParam = repo || project;
             let resolvedRepoId = repository_id || null;
