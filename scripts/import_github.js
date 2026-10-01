@@ -6,6 +6,8 @@ import path from 'path';
 import { query, pool } from '../db/pool.js';
 import { getEmbedding, isEmbeddable, MAX_EMBED_CHARS } from '../lib/embedding.js';
 
+import { extractSymbolsAndImports } from '../lib/ast-chunker.js';
+
 const execPromise = util.promisify(exec);
 
 async function isGitRepo(targetDir) {
@@ -38,17 +40,41 @@ async function processBlob(blobHash, name, repoId, targetDir) {
                     embeddingStr = `[${vector.join(',')}]`;
                 }
             }
+
+            // Extract and index code symbols
+            try {
+                const { symbols } = extractSymbolsAndImports(text, name);
+                if (symbols && symbols.length > 0) {
+                    const BATCH_SIZE = 50;
+                    for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+                        const batch = symbols.slice(i, i + BATCH_SIZE);
+                        const values = [];
+                        const params = [];
+                        let pIdx = 1;
+                        for (const sym of batch) {
+                            values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8})`);
+                            params.push(blobHash, repoId, name, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content);
+                            pIdx += 9;
+                        }
+                        await query(`
+                            INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content)
+                            VALUES ${values.join(', ')}
+                        `, params);
+                    }
+                }
+            } catch (_) {}
         }
 
+        const fileName = path.basename(name);
         if (embeddingStr) {
             await query(
-                `INSERT INTO blobs (id, repository_id, content, size, embedding) VALUES ($1, $2, $3, $4, $5::vector) ON CONFLICT (id) DO NOTHING`,
-                [blobHash, repoId, stdout, stdout.length, embeddingStr]
+                `INSERT INTO blobs (id, repository_id, content, size, embedding, file_name, file_path, storage_mode) VALUES ($1, $2, $3, $4, $5::vector, $6, $7, 'direct') ON CONFLICT (id) DO UPDATE SET file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path`,
+                [blobHash, repoId, stdout, stdout.length, embeddingStr, fileName, name]
             );
         } else {
             await query(
-                `INSERT INTO blobs (id, repository_id, content, size) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
-                [blobHash, repoId, stdout, stdout.length]
+                `INSERT INTO blobs (id, repository_id, content, size, file_name, file_path, storage_mode) VALUES ($1, $2, $3, $4, $5, $6, 'direct') ON CONFLICT (id) DO UPDATE SET file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path`,
+                [blobHash, repoId, stdout, stdout.length, fileName, name]
             );
         }
     } catch (e) {

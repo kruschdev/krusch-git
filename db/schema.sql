@@ -66,6 +66,8 @@ ALTER TABLE blobs ADD COLUMN IF NOT EXISTS tsv tsvector
 
 CREATE INDEX IF NOT EXISTS blobs_embedding_idx ON blobs USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS blobs_tsv_idx ON blobs USING gin(tsv);
+CREATE INDEX IF NOT EXISTS idx_blobs_repo_path ON blobs(repository_id, file_path);
+CREATE INDEX IF NOT EXISTS idx_blobs_repo_name ON blobs(repository_id, file_name);
 
 -- Code Symbols (Functions, Classes, Methods, Routes)
 CREATE TABLE IF NOT EXISTS code_symbols (
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS code_symbols (
 
 CREATE INDEX IF NOT EXISTS idx_code_symbols_blob ON code_symbols(blob_id);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_repo_name ON code_symbols(repository_id, symbol_name);
+CREATE INDEX IF NOT EXISTS idx_code_symbols_repo_path ON code_symbols(repository_id, file_path);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_type ON code_symbols(symbol_type);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_tsv ON code_symbols USING gin(tsv);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_embedding ON code_symbols USING hnsw (embedding vector_cosine_ops);

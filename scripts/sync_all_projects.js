@@ -104,9 +104,30 @@ async function main() {
         return results;
     }
 
+    // Excluded from automatic discovery to prevent massive third-party scanning bloat
+    const EXCLUDED_SCAN = new Set([
+        'archive', 'reference', 'vllm', 'vllm-hermes', 'TheAgentCompany',
+        'BitNet', 'NeoVertex1', 'tabbyAPI', 'sandbox', 'scratchpad', 'scratch',
+        'node_modules', '.git', 'logs', 'dist', 'build'
+    ]);
+
+    // Discover all active project directories in HOMELAB_ROOT
+    let discoveredProjects = [];
+    try {
+        const entries = await fs.promises.readdir(HOMELAB_ROOT, { withFileTypes: true });
+        for (const entry of entries) {
+            if ((entry.isDirectory() || entry.isSymbolicLink()) && !EXCLUDED_SCAN.has(entry.name) && !entry.name.startsWith('.')) {
+                discoveredProjects.push(entry.name);
+            }
+        }
+    } catch (_) {}
+
+    // Union of explicit canonical projects + auto-discovered homelab projects
+    const allProjectNames = Array.from(new Set([...PROJECTS, ...discoveredProjects])).sort();
+
     // Build unified task list and filter non-existent paths gracefully
     const allTasks = [
-        ...PROJECTS.map(p => ({ name: p, path: path.join(HOMELAB_ROOT, p) })),
+        ...allProjectNames.map(p => ({ name: p, path: path.join(HOMELAB_ROOT, p) })),
         ...ROOT_DIRS.map(d => ({ name: d.name, path: d.path }))
     ].filter(task => {
         if (fs.existsSync(task.path)) {
