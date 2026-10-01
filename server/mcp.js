@@ -58,14 +58,21 @@ async function resolveRepoId(repoParam, repoIdParam) {
 }
 
 // ── Health Check ──────────────────────────────────────────────────────────────
-async function verifyDatabase() {
-    try {
-        await pool.query('SELECT 1');
-        console.error('[krusch-git] Database connection verified.');
-    } catch (err) {
-        console.error('[krusch-git] FATAL: Cannot reach PostgreSQL:', err.message);
-        process.exit(1);
+async function verifyDatabase(retries = 3, delayMs = 1000) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            await pool.query('SELECT 1');
+            console.error('[krusch-git] Database connection verified.');
+            return true;
+        } catch (err) {
+            console.warn(`[krusch-git] Database connection attempt ${attempt}/${retries} failed: ${err.message}`);
+            if (attempt < retries) {
+                await new Promise(r => setTimeout(r, delayMs * attempt));
+            }
+        }
     }
+    console.error('[krusch-git] WARNING: Cannot reach PostgreSQL on startup. Server running in resilient mode and will retry on tool requests.');
+    return false;
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
@@ -218,21 +225,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!blob_id && !file_path) {
                 throw new McpError(ErrorCode.InvalidParams, "Either 'blob_id' or 'file_path' is required.");
             }
+            const cleanFilePath = file_path ? String(file_path).trim().replace(/^[/\\]+/, '') : null;
+            if (cleanFilePath && cleanFilePath.includes('\0')) {
+                throw new McpError(ErrorCode.InvalidParams, "Invalid file_path containing null bytes.");
+            }
+
             let blob = null;
 
             if (blob_id) {
                 blob = await getBlob(blob_id);
-            } else if (file_path) {
+            } else if (cleanFilePath) {
                 const repoParam = repo || project;
                 const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
                 const blobRes = await pool.query(`
                     SELECT b.*, r.name AS project 
                     FROM blobs b
                     JOIN repositories r ON b.repository_id = r.id
-                    WHERE (b.file_path = $1 OR b.file_name = $1)
-                      ${resolvedRepoId ? 'AND b.repository_id = $2' : ''}
+                    WHERE (b.file_path = $1 OR b.file_path = $2 OR b.file_name = $1)
+                      ${resolvedRepoId ? 'AND b.repository_id = $3' : ''}
                     ORDER BY b.last_seen_at DESC LIMIT 1
-                `, resolvedRepoId ? [file_path, resolvedRepoId] : [file_path]);
+                `, resolvedRepoId ? [cleanFilePath, file_path, resolvedRepoId] : [cleanFilePath, file_path]);
 
                 if (blobRes.rows.length > 0) {
                     blob = blobRes.rows[0];
@@ -240,27 +252,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             // Direct filesystem fallback if unindexed or pointer resolution needs local disk
-            if (!blob && file_path && (repo || project)) {
+            if (!blob && cleanFilePath && (repo || project)) {
                 const rawProject = String(repo || project).trim();
                 const safeProject = path.basename(rawProject);
-                const cleanFilePath = String(file_path).trim().replace(/^[/\\]+/, '');
                 
                 if (safeProject && safeProject !== '.' && safeProject !== '..') {
-                    const targetPath = path.resolve(PROJECTS_ROOT, safeProject, cleanFilePath);
-                    const rel = path.relative(PROJECTS_ROOT, targetPath);
-                    // Strict path containment: must remain inside PROJECTS_ROOT
-                    if (!rel.startsWith('..') && !path.isAbsolute(rel) && rel !== '') {
-                        try {
-                            const buffer = await fs.readFile(targetPath);
-                            if (buffer.subarray(0, 1024).includes(0)) {
-                                return { content: [{ type: "text", text: `[Binary file: ${path.basename(cleanFilePath)} (${buffer.length} bytes)]` }] };
-                            }
-                            let textContent = buffer.toString('utf-8');
-                            if (textContent.length > 500000) {
-                                textContent = textContent.slice(0, 500000) + `\n\n... [Content truncated: file size (${buffer.length} bytes) exceeds limit]`;
-                            }
-                            return { content: [{ type: "text", text: textContent }] };
-                        } catch (_) {}
+                    const projectDir = path.resolve(PROJECTS_ROOT, safeProject);
+                    const targetPath = path.resolve(projectDir, cleanFilePath);
+                    const relToProject = path.relative(projectDir, targetPath);
+
+                    // Secondary root-directory fallback (e.g. scripts, lib, .agent in homelab root)
+                    const MONOREPO_ROOT = path.resolve(PROJECTS_ROOT, '..');
+                    const altProjectDir = path.resolve(MONOREPO_ROOT, safeProject);
+                    const altPath = path.resolve(altProjectDir, cleanFilePath);
+                    const relToAlt = path.relative(altProjectDir, altPath);
+
+                    let chosenTarget = null;
+                    let baseDir = null;
+
+                    if (!relToProject.startsWith('..') && !path.isAbsolute(relToProject) && relToProject !== '') {
+                        chosenTarget = targetPath;
+                        baseDir = projectDir;
+                    } else if (!relToAlt.startsWith('..') && !path.isAbsolute(relToAlt) && relToAlt !== '') {
+                        chosenTarget = altPath;
+                        baseDir = altProjectDir;
+                    } else {
+                        throw new McpError(ErrorCode.InvalidParams, `Access denied: '${cleanFilePath}' escapes repository root.`);
+                    }
+
+                    try {
+                        const realBaseDir = await fs.realpath(baseDir);
+                        const realPath = await fs.realpath(chosenTarget);
+                        const relReal = path.relative(realBaseDir, realPath);
+                        if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+                            throw new McpError(ErrorCode.InvalidParams, `Access denied: symlink points outside repository.`);
+                        }
+
+                        const buffer = await fs.readFile(realPath);
+                        if (buffer.subarray(0, 1024).includes(0)) {
+                            return { content: [{ type: "text", text: `[Binary file: ${path.basename(cleanFilePath)} (${buffer.length} bytes)]` }] };
+                        }
+                        let textContent = buffer.toString('utf-8');
+                        if (textContent.length > 500000) {
+                            textContent = textContent.slice(0, 500000) + `\n\n... [Content truncated: file size (${buffer.length} bytes) exceeds limit]`;
+                        }
+                        return { content: [{ type: "text", text: textContent }] };
+                    } catch (e) {
+                        if (e instanceof McpError) throw e;
                     }
                 }
             }
@@ -350,21 +388,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!blob_id && !file_path) {
                 throw new McpError(ErrorCode.InvalidParams, "Either 'file_path' or 'blob_id' is required.");
             }
+            const cleanFilePath = file_path ? String(file_path).trim().replace(/^[/\\]+/, '') : null;
+            if (cleanFilePath && cleanFilePath.includes('\0')) {
+                throw new McpError(ErrorCode.InvalidParams, "Invalid file_path containing null bytes.");
+            }
+
             let symbols = [];
 
             if (blob_id) {
                 symbols = await getSymbolsForBlob(blob_id);
-            } else if (file_path) {
+            } else if (cleanFilePath) {
                 const repoParam = repo || project;
                 const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
                 const symRes = await pool.query(`
                     SELECT s.*, r.name AS project
                     FROM code_symbols s
                     JOIN repositories r ON r.id = s.repository_id
-                    WHERE (s.file_path = $1 OR s.file_path ILIKE '%' || $1)
-                      ${resolvedRepoId ? 'AND s.repository_id = $2' : ''}
+                    WHERE (s.file_path = $1 OR s.file_path = $2 OR s.file_path ILIKE '%' || $1)
+                      ${resolvedRepoId ? 'AND s.repository_id = $3' : ''}
                     ORDER BY s.start_line ASC
-                `, resolvedRepoId ? [file_path, resolvedRepoId] : [file_path]);
+                `, resolvedRepoId ? [cleanFilePath, file_path, resolvedRepoId] : [cleanFilePath, file_path]);
                 symbols = symRes.rows;
             }
 
@@ -384,8 +427,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const repoParam = repo || project;
             let resolvedRepoId = await resolveRepoId(repoParam, repository_id);
 
-            let targetFilePath = file_path;
-            let targetSymbol = symbol;
+            let targetFilePath = file_path ? String(file_path).trim().replace(/^[/\\]+/, '') : null;
+            let targetSymbol = symbol ? String(symbol).trim() : null;
+
+            if (targetFilePath && targetFilePath.includes('\0')) {
+                throw new McpError(ErrorCode.InvalidParams, "Invalid file_path containing null bytes.");
+            }
 
             // If symbol is passed without file_path, look up the authoritative file declaration
             if (!targetFilePath && targetSymbol) {
@@ -409,8 +456,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             if (!resolvedRepoId) {
                 const repoFind = await pool.query(
-                    `SELECT repository_id FROM code_symbols WHERE file_path = $1 LIMIT 1`,
-                    [targetFilePath]
+                    `SELECT repository_id FROM code_symbols WHERE file_path = $1 OR file_path = $2 LIMIT 1`,
+                    [targetFilePath, file_path]
                 );
                 if (repoFind.rows.length > 0) {
                     resolvedRepoId = repoFind.rows[0].repository_id;

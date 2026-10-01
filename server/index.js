@@ -80,7 +80,11 @@ app.get('/api/repos/:id/tree/:treeId', async (req, res) => {
 
 app.get('/api/blobs/:id', async (req, res) => {
     try {
-        const blob = await git.getBlob(req.params.id);
+        const blobId = String(req.params.id || '').trim();
+        if (!blobId || blobId.includes('\0')) {
+            return res.status(400).json({ error: 'Invalid blob ID' });
+        }
+        const blob = await git.getBlob(blobId);
         if (!blob) {
             return res.status(404).json({ error: 'Blob not found' });
         }
@@ -88,10 +92,14 @@ app.get('/api/blobs/:id', async (req, res) => {
         if (!buffer) {
             return res.status(500).json({ error: 'Failed to resolve blob content' });
         }
+        const isBinary = buffer.subarray(0, 1024).includes(0);
         res.json({
             id: blob.id,
             size: blob.size,
-            content: buffer.toString('utf-8')
+            file_name: blob.file_name,
+            file_path: blob.file_path,
+            is_binary: isBinary,
+            content: isBinary ? `[Binary file: ${blob.file_name || blob.id} (${blob.size} bytes)]` : buffer.toString('utf-8')
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -107,14 +115,21 @@ app.use((req, res, next) => {
 });
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
-async function verifyDatabase() {
-    try {
-        await pool.query('SELECT 1');
-        console.log('[pg-git] Database connection verified.');
-    } catch (err) {
-        console.error('[pg-git] FATAL: Cannot reach PostgreSQL:', err.message);
-        process.exit(1);
+async function verifyDatabase(retries = 3, delayMs = 1000) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            await pool.query('SELECT 1');
+            console.log('[pg-git] Database connection verified.');
+            return true;
+        } catch (err) {
+            console.warn(`[pg-git] Database connection attempt ${attempt}/${retries} failed: ${err.message}`);
+            if (attempt < retries) {
+                await new Promise(r => setTimeout(r, delayMs * attempt));
+            }
+        }
     }
+    console.error('[pg-git] WARNING: Cannot reach PostgreSQL on startup. HTTP server will start in degraded mode.');
+    return false;
 }
 
 let httpServer;

@@ -83,22 +83,42 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
         
         if (symbols && symbols.length > 0) {
             await query(`DELETE FROM code_symbols WHERE blob_id = $1`, [sha]);
-            for (const sym of symbols) {
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+                const batch = symbols.slice(i, i + BATCH_SIZE);
+                const values = [];
+                const params = [];
+                let pIdx = 1;
+                for (const sym of batch) {
+                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8})`);
+                    params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content);
+                    pIdx += 9;
+                }
                 await query(`
                     INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                `, [sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content]);
+                    VALUES ${values.join(', ')}
+                `, params);
             }
             syncProgress.symbols += symbols.length;
         }
 
         if (imports && imports.length > 0) {
             await query(`DELETE FROM code_symbol_edges WHERE source_blob_id = $1`, [sha]);
-            for (const imp of imports) {
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < imports.length; i += BATCH_SIZE) {
+                const batch = imports.slice(i, i + BATCH_SIZE);
+                const values = [];
+                const params = [];
+                let pIdx = 1;
+                for (const imp of batch) {
+                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5})`);
+                    params.push(repoId, sha, relativePath, imp.targetPath, imp.relation, imp.symbols);
+                    pIdx += 6;
+                }
                 await query(`
                     INSERT INTO code_symbol_edges (repository_id, source_blob_id, source_path, target_path, relation, symbols)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                `, [repoId, sha, relativePath, imp.targetPath, imp.relation, imp.symbols]);
+                    VALUES ${values.join(', ')}
+                `, params);
             }
             syncProgress.edges += imports.length;
         }
@@ -108,7 +128,6 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
 }
 
 async function insertBlob(repoId, buffer, filePath, rootDir) {
-    console.log(`[Blob Debug] filePath: ${filePath}, repoId: ${repoId}, type: ${typeof repoId}`);
     const sha = hashContent(buffer);
     const ext = path.extname(filePath).toLowerCase();
     const fileName = path.basename(filePath);
@@ -175,7 +194,6 @@ function hashTree(entries) {
 }
 
 async function processDirectory(dirPath, repoId, rootDir) {
-    console.log(`[Directory Debug] dirPath: ${dirPath}, repoId: ${repoId}, type: ${typeof repoId}`);
     const items = await fs.readdir(dirPath, { withFileTypes: true });
     const entries = [];
 

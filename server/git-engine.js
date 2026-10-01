@@ -74,20 +74,64 @@ export async function resolveBlobContent(blob) {
             }
         }
         
-        const safeProject = path.basename(String(projectName).trim());
-        const cleanFilePath = String(blob.file_path).trim().replace(/^[/\\]+/, '');
-        if (!safeProject || safeProject === '.' || safeProject === '..') {
+        const safeProject = path.basename(String(projectName || '').trim());
+        const cleanFilePath = String(blob.file_path || '').trim().replace(/^[/\\]+/, '');
+        if (!safeProject || safeProject === '.' || safeProject === '..' || !cleanFilePath) {
             return null;
         }
 
-        const absolutePath = path.resolve(PROJECTS_ROOT, safeProject, cleanFilePath);
-        const rel = path.relative(PROJECTS_ROOT, absolutePath);
-        // Verify path is safe and strictly inside PROJECTS_ROOT
-        if (rel.startsWith('..') || path.isAbsolute(rel) || rel === '') {
-            throw new Error(`Path traversal detected: ${absolutePath}`);
+        if (cleanFilePath.includes('\0') || safeProject.includes('\0')) {
+            throw new Error(`Path traversal / invalid characters detected in ${cleanFilePath}`);
+        }
+
+        // Primary: look inside PROJECTS_ROOT/<project>/<file_path>
+        const projectDir = path.resolve(PROJECTS_ROOT, safeProject);
+        const absolutePath = path.resolve(projectDir, cleanFilePath);
+        const relToProject = path.relative(projectDir, absolutePath);
+
+        // Strict containment: must remain strictly inside this specific project directory
+        if (relToProject.startsWith('..') || path.isAbsolute(relToProject) || relToProject === '') {
+            throw new Error(`Path traversal detected: ${absolutePath} is outside repository root ${projectDir}`);
+        }
+
+        // Secondary fallback: check root-level homelab directories (e.g. scripts, lib, .agent)
+        const MONOREPO_ROOT = path.resolve(PROJECTS_ROOT, '..');
+        const altProjectDir = path.resolve(MONOREPO_ROOT, safeProject);
+        const altPath = path.resolve(altProjectDir, cleanFilePath);
+        const relToAlt = path.relative(altProjectDir, altPath);
+
+        let targetPath = absolutePath;
+        let baseDir = projectDir;
+
+        // Check if primary path exists; if not, check secondary altPath if valid
+        let stat = null;
+        try {
+            stat = await fs.stat(absolutePath);
+        } catch (e) {
+            if (e.code === 'ENOENT' && !relToAlt.startsWith('..') && !path.isAbsolute(relToAlt) && relToAlt !== '') {
+                try {
+                    stat = await fs.stat(altPath);
+                    targetPath = altPath;
+                    baseDir = altProjectDir;
+                } catch (_) {
+                    // Neither exists
+                }
+            }
+        }
+
+        if (!stat) {
+            return null;
+        }
+
+        // Symlink dereference verification: realpath must also remain inside realBaseDir
+        const realBaseDir = await fs.realpath(baseDir);
+        const realTarget = await fs.realpath(targetPath);
+        const relReal = path.relative(realBaseDir, realTarget);
+        if (relReal.startsWith('..') || path.isAbsolute(relReal)) {
+            throw new Error(`Symlink traversal detected: ${realTarget} points outside ${realBaseDir}`);
         }
         
-        return await fs.readFile(absolutePath);
+        return await fs.readFile(realTarget);
     } catch (e) {
         console.error(`[resolveBlobContent] Failed to read pointer file for blob ${blob.id}: ${e.message}`);
         return null;
@@ -248,6 +292,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
 
     // 3. LEXICAL BM25 SEARCH (Fallback or pure keyword)
     if (textQuery) {
+        const escapedLike = textQuery.replace(/[_%]/g, '\\$&');
         let sql = `
             SELECT 
                 b.id,
@@ -264,10 +309,10 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
             FROM blobs b
             JOIN repositories r ON r.id = b.repository_id
             WHERE (b.tsv @@ plainto_tsquery('simple', $1) 
-                   OR b.file_name ILIKE '%' || $1 || '%' 
-                   OR b.file_path ILIKE '%' || $1 || '%')
+                   OR b.file_name ILIKE '%' || $2 || '%' 
+                   OR b.file_path ILIKE '%' || $2 || '%')
         `;
-        const params = [textQuery];
+        const params = [textQuery, escapedLike];
         if (repositoryId !== undefined && repositoryId !== null) {
             params.push(repositoryId);
             sql += ` AND b.repository_id = $${params.length}`;
@@ -293,7 +338,11 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
  * @returns {Promise<Array>}
  */
 export async function searchSymbols(queryText, limit = 10, repositoryId = null, options = {}) {
+    const rawQuery = String(queryText || '').trim();
+    if (!rawQuery) return [];
+
     const symbolType = options.symbol_type || null;
+    const escapedLike = rawQuery.replace(/[_%]/g, '\\$&');
     
     let sql = `
         SELECT 
@@ -311,7 +360,7 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
             (
                 CASE 
                     WHEN LOWER(s.symbol_name) = LOWER($1) THEN 1.0
-                    WHEN s.symbol_name ILIKE '%' || $1 || '%' THEN 0.85
+                    WHEN s.symbol_name ILIKE '%' || $2 || '%' THEN 0.85
                     ELSE COALESCE(ts_rank_cd(s.tsv, plainto_tsquery('simple', $1)), 0.1)
                 END
             ) AS similarity
@@ -319,11 +368,11 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
         JOIN repositories r ON r.id = s.repository_id
         WHERE (
             LOWER(s.symbol_name) = LOWER($1)
-            OR s.symbol_name ILIKE '%' || $1 || '%'
+            OR s.symbol_name ILIKE '%' || $2 || '%'
             OR s.tsv @@ plainto_tsquery('simple', $1)
         )
     `;
-    const params = [queryText];
+    const params = [rawQuery, escapedLike];
     if (repositoryId) {
         params.push(repositoryId);
         sql += ` AND s.repository_id = $${params.length}`;
@@ -332,7 +381,7 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
         params.push(symbolType);
         sql += ` AND s.symbol_type = $${params.length}`;
     }
-    params.push(limit);
+    params.push(Math.max(1, Math.min(Number(limit) || 10, 100)));
     sql += ` ORDER BY similarity DESC, s.start_line ASC LIMIT $${params.length}`;
 
     const res = await query(sql, params);
@@ -346,6 +395,7 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
  * @returns {Promise<Array>}
  */
 export async function getSymbolsForBlob(blobId) {
+    if (!blobId) return [];
     const res = await query(`
         SELECT s.*, r.name AS project
         FROM code_symbols s
@@ -365,34 +415,52 @@ export async function getSymbolsForBlob(blobId) {
  * @returns {Promise<{ filePath: string, repositoryId: number, symbols: Array, imports: Array, dependents: Array }>}
  */
 export async function getSymbolGraph(filePath, repositoryId) {
+    const cleanFilePath = String(filePath || '').trim().replace(/^[/\\]+/, '');
+    if (!cleanFilePath) {
+        return { filePath: '', repositoryId, symbols: [], imports: [], dependents: [] };
+    }
+
     // Outbound imports
     const importsRes = await query(`
         SELECT target_path, relation, symbols
         FROM code_symbol_edges
-        WHERE repository_id = $1 AND source_path = $2
+        WHERE repository_id = $1 AND (source_path = $2 OR source_path = $3)
         ORDER BY target_path ASC
-    `, [repositoryId, filePath]);
+    `, [repositoryId, cleanFilePath, filePath]);
 
     // Inbound dependents (files that import this file)
-    const baseName = path.basename(filePath, path.extname(filePath));
-    const dependentsRes = await query(`
-        SELECT source_path, relation, symbols
-        FROM code_symbol_edges
-        WHERE repository_id = $1 
-          AND (target_path = $2 OR target_path ILIKE '%' || $3 || '%')
-        ORDER BY source_path ASC
-    `, [repositoryId, filePath, baseName]);
+    const baseName = path.basename(cleanFilePath, path.extname(cleanFilePath));
+    const isGeneric = ['index', 'main', 'app', 'utils', 'config', 'test', 'types', 'mod', 'lib'].includes(baseName.toLowerCase());
+
+    let dependentsRes;
+    if (isGeneric || !baseName) {
+        dependentsRes = await query(`
+            SELECT source_path, relation, symbols
+            FROM code_symbol_edges
+            WHERE repository_id = $1 
+              AND (target_path = $2 OR target_path ILIKE '%' || $2)
+            ORDER BY source_path ASC
+        `, [repositoryId, cleanFilePath]);
+    } else {
+        dependentsRes = await query(`
+            SELECT source_path, relation, symbols
+            FROM code_symbol_edges
+            WHERE repository_id = $1 
+              AND (target_path = $2 OR target_path ILIKE '%' || $2 OR target_path ILIKE '%' || $3 || '%')
+            ORDER BY source_path ASC
+        `, [repositoryId, cleanFilePath, baseName]);
+    }
 
     // File's own symbols
     const symbolsRes = await query(`
         SELECT symbol_name, symbol_type, start_line, end_line, signature
         FROM code_symbols
-        WHERE repository_id = $1 AND file_path = $2
+        WHERE repository_id = $1 AND (file_path = $2 OR file_path = $3)
         ORDER BY start_line ASC
-    `, [repositoryId, filePath]);
+    `, [repositoryId, cleanFilePath, filePath]);
 
     return {
-        filePath,
+        filePath: cleanFilePath,
         repositoryId,
         symbols: symbolsRes.rows,
         imports: importsRes.rows,
