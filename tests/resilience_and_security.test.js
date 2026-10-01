@@ -138,6 +138,50 @@ test('Resilience: Database verification retries and returns false instead of pro
     assert.strictEqual(healthy, true);
 });
 
+test('REST API: Search, Symbols, and Graph endpoints respond correctly', async () => {
+    const http = await import('node:http');
+    const { app } = await import('../server/index.js');
+
+    const srv = http.createServer(app);
+    await new Promise((resolve) => srv.listen(0, resolve));
+    const port = srv.address().port;
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+        // 1. Missing query returns 400
+        const badSearch = await fetch(`${base}/api/search`);
+        assert.strictEqual(badSearch.status, 400);
+
+        // 2. Symbol search returns 200 with matching symbols
+        const symRes = await fetch(`${base}/api/symbols?q=getChunkedCentroidEmbedding`);
+        assert.strictEqual(symRes.status, 200);
+        const syms = await symRes.json();
+        assert.ok(Array.isArray(syms));
+        assert.ok(syms.some(s => s.symbol_name === 'getChunkedCentroidEmbedding'));
+
+        // 3. Search endpoint returns 200 with array
+        const searchRes = await fetch(`${base}/api/search?q=getChunkedCentroidEmbedding&type=keyword`);
+        assert.strictEqual(searchRes.status, 200);
+        const searchData = await searchRes.json();
+        assert.ok(Array.isArray(searchData));
+
+        // 4. Graph endpoint resolves symbol declarations
+        const graphRes = await fetch(`${base}/api/graph?symbol=getChunkedCentroidEmbedding`);
+        assert.strictEqual(graphRes.status, 200);
+        const graphData = await graphRes.json();
+        assert.ok(Array.isArray(graphData.symbols));
+        assert.ok(Array.isArray(graphData.imports));
+        assert.ok(Array.isArray(graphData.dependents));
+
+        // 5. Null byte in blob ID returns 400
+        const nullBlob = await fetch(`${base}/api/blobs/test%00blob`);
+        assert.strictEqual(nullBlob.status, 400);
+    } finally {
+        await new Promise((resolve) => srv.close(resolve));
+    }
+});
+
 after(async () => {
     await pool.end();
 });
+
