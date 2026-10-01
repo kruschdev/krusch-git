@@ -62,11 +62,30 @@ async function main() {
 
     const syncScript = path.join(__dirname, 'sync_to_pg.js');
 
+    if (process.argv.includes('--help') || process.argv.includes('-h')) {
+        console.log(`
+Usage: node scripts/sync_all_projects.js [options]
+
+Options:
+  --project=<name>  Sync only a specific project (e.g. --project=compass-concierge)
+  --parallel=<N>    Concurrent project syncs (default: 3)
+  --help, -h        Show this help message
+
+Environment Variables:
+  SKIP_LLM_SUMMARY  Set to 'true' to disable Ollama LLM summary generation
+  DATABASE_URL      PostgreSQL connection URL
+`);
+        process.exit(0);
+    }
+
+    const projectFlag = process.argv.find(a => a.startsWith('--project='));
+    const singleProject = projectFlag ? projectFlag.split('=')[1]?.trim() : null;
+
     // Parse --parallel=N flag (default 3)
     const parallelFlag = process.argv.find(a => a.startsWith('--parallel='));
     const PARALLEL = Math.max(1, parseInt(parallelFlag?.split('=')[1] || '3', 10));
 
-    console.log(`=== Batch Sync: All Active Projects (parallel=${PARALLEL}) ===\n`);
+    console.log(`=== Batch Sync: ${singleProject ? `Project [${singleProject}]` : 'All Active Projects'} (parallel=${PARALLEL}) ===\n`);
 
     /**
      * Run sync tasks with concurrency limit.
@@ -122,14 +141,21 @@ async function main() {
         }
     } catch (_) {}
 
-    // Union of explicit canonical projects + auto-discovered homelab projects
-    const allProjectNames = Array.from(new Set([...PROJECTS, ...discoveredProjects])).sort();
+    let allTasks;
+    if (singleProject) {
+        allTasks = [{ name: singleProject, path: path.join(HOMELAB_ROOT, singleProject) }];
+    } else {
+        // Union of explicit canonical projects + auto-discovered homelab projects
+        const allProjectNames = Array.from(new Set([...PROJECTS, ...discoveredProjects])).sort();
 
-    // Build unified task list and filter non-existent paths gracefully
-    const allTasks = [
-        ...allProjectNames.map(p => ({ name: p, path: path.join(HOMELAB_ROOT, p) })),
-        ...ROOT_DIRS.map(d => ({ name: d.name, path: d.path }))
-    ].filter(task => {
+        // Build unified task list and filter non-existent paths gracefully
+        allTasks = [
+            ...allProjectNames.map(p => ({ name: p, path: path.join(HOMELAB_ROOT, p) })),
+            ...ROOT_DIRS.map(d => ({ name: d.name, path: d.path }))
+        ];
+    }
+
+    allTasks = allTasks.filter(task => {
         if (fs.existsSync(task.path)) {
             return true;
         } else {

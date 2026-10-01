@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { query, pool } from '../db/pool.js';
@@ -309,7 +310,31 @@ async function processDirectory(dirPath, repoId, rootDir) {
 }
 
 async function main() {
-    const targetDir = process.argv[2] ? path.resolve(process.argv[2]) : process.cwd();
+    const rawArg = process.argv[2];
+    if (rawArg === '--help' || rawArg === '-h') {
+        console.log(`
+Usage: node scripts/sync_to_pg.js [target_directory]
+
+Options:
+  --help, -h       Show this help message
+
+Environment Variables:
+  SKIP_LLM_SUMMARY Set to 'true' to disable Ollama LLM summary generation
+  DATABASE_URL     PostgreSQL connection URL
+`);
+        process.exit(0);
+    }
+
+    const targetDir = rawArg ? path.resolve(rawArg) : process.cwd();
+    if (!fsSync.existsSync(targetDir)) {
+        console.error(`❌ Error: Target directory does not exist: ${targetDir}`);
+        process.exit(1);
+    }
+    const stat = fsSync.statSync(targetDir);
+    if (!stat.isDirectory()) {
+        console.error(`❌ Error: Target path is not a directory: ${targetDir}`);
+        process.exit(1);
+    }
     const repoName = path.basename(targetDir);
     
     syncProgress = { processed: 0, total: 0, embedded: 0, skipped: 0, symbols: 0, edges: 0 };
