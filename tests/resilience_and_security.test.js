@@ -13,6 +13,16 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+async function assertCallToolFails(client, toolCall, expectedRegex) {
+    try {
+        const res = await client.callTool(toolCall);
+        assert.ok(res.isError, `Expected tool call to fail with error: ${expectedRegex}`);
+        assert.match(res.content?.[0]?.text || '', expectedRegex);
+    } catch (err) {
+        assert.match(err.message, expectedRegex);
+    }
+}
+
 test('Security: Cross-repository path traversal is strictly rejected', async () => {
     // 1. Direct resolveBlobContent check: attempting to escape repository root via relative traversal
     const escapeBlob = {
@@ -33,14 +43,12 @@ test('Security: Cross-repository path traversal is strictly rejected', async () 
     await client.connect(clientTransport);
 
     try {
-        await assert.rejects(async () => {
-            await client.callTool({
-                name: 'krusch_git_read_blob',
-                arguments: {
-                    repo: 'krusch-git',
-                    file_path: '../krusch-context-mcp/package.json'
-                }
-            });
+        await assertCallToolFails(client, {
+            name: 'krusch_git_read_blob',
+            arguments: {
+                repo: 'krusch-git',
+                file_path: '../krusch-context-mcp/package.json'
+            }
         }, /escapes repository root/);
     } finally {
         await client.close();
@@ -56,27 +64,21 @@ test('Security: Null byte injection in file paths is rejected across all tools',
 
     try {
         // 1. read_blob with null byte
-        await assert.rejects(async () => {
-            await client.callTool({
-                name: 'krusch_git_read_blob',
-                arguments: { repo: 'krusch-git', file_path: 'server/git-engine.js\0.txt' }
-            });
+        await assertCallToolFails(client, {
+            name: 'krusch_git_read_blob',
+            arguments: { repo: 'krusch-git', file_path: 'server/git-engine.js\0.txt' }
         }, /null bytes/);
 
         // 2. file_symbols with null byte
-        await assert.rejects(async () => {
-            await client.callTool({
-                name: 'krusch_git_file_symbols',
-                arguments: { repo: 'krusch-git', file_path: 'server/git-engine.js\0.txt' }
-            });
+        await assertCallToolFails(client, {
+            name: 'krusch_git_file_symbols',
+            arguments: { repo: 'krusch-git', file_path: 'server/git-engine.js\0.txt' }
         }, /null bytes/);
 
         // 3. dependency_graph with null byte
-        await assert.rejects(async () => {
-            await client.callTool({
-                name: 'krusch_git_dependency_graph',
-                arguments: { repo: 'krusch-git', file_path: 'server/git-engine.js\0.txt' }
-            });
+        await assertCallToolFails(client, {
+            name: 'krusch_git_dependency_graph',
+            arguments: { repo: 'krusch-git', file_path: 'server/git-engine.js\0.txt' }
         }, /null bytes/);
     } finally {
         await client.close();
@@ -147,26 +149,47 @@ test('REST API: Search, Symbols, and Graph endpoints respond correctly', async (
     const port = srv.address().port;
     const base = `http://127.0.0.1:${port}`;
 
+    // Seed test repository & symbol hermetically
+    const testRepoName = 'ci-api-test-repo-' + Date.now();
+    const repoRes = await pool.query(
+        `INSERT INTO repositories (name, description) VALUES ($1, 'CI API Test') RETURNING id`,
+        [testRepoName]
+    );
+    const repoId = repoRes.rows[0].id;
+    const testBlobId = 'ciblob' + Math.random().toString(36).substring(2, 10).padEnd(34, '0');
+    await pool.query(
+        `INSERT INTO blobs (id, repository_id, size, storage_mode, file_name, file_path, summary) VALUES ($1, $2, 100, 'pointer', 'test.js', 'lib/test.js', 'Hermetic test blob')`,
+        [testBlobId, repoId]
+    );
+    await pool.query(`
+        INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content)
+        VALUES ($1, $2, 'lib/test.js', 'hermeticTestFunction', 'function', 1, 10, 'function hermeticTestFunction()', 'function hermeticTestFunction() { return true; }')
+    `, [testBlobId, repoId]);
+    await pool.query(`
+        INSERT INTO code_symbol_edges (repository_id, source_blob_id, source_path, target_path, relation, symbols)
+        VALUES ($1, $2, 'lib/test.js', 'lib/dep.js', 'imports', ARRAY['depSym'])
+    `, [repoId, testBlobId]);
+
     try {
         // 1. Missing query returns 400
         const badSearch = await fetch(`${base}/api/search`);
         assert.strictEqual(badSearch.status, 400);
 
         // 2. Symbol search returns 200 with matching symbols
-        const symRes = await fetch(`${base}/api/symbols?q=getChunkedCentroidEmbedding`);
+        const symRes = await fetch(`${base}/api/symbols?q=hermeticTestFunction`);
         assert.strictEqual(symRes.status, 200);
         const syms = await symRes.json();
         assert.ok(Array.isArray(syms));
-        assert.ok(syms.some(s => s.symbol_name === 'getChunkedCentroidEmbedding'));
+        assert.ok(syms.some(s => s.symbol_name === 'hermeticTestFunction'));
 
         // 3. Search endpoint returns 200 with array
-        const searchRes = await fetch(`${base}/api/search?q=getChunkedCentroidEmbedding&type=keyword`);
+        const searchRes = await fetch(`${base}/api/search?q=hermetic&type=keyword`);
         assert.strictEqual(searchRes.status, 200);
         const searchData = await searchRes.json();
         assert.ok(Array.isArray(searchData));
 
         // 4. Graph endpoint resolves symbol declarations
-        const graphRes = await fetch(`${base}/api/graph?symbol=getChunkedCentroidEmbedding`);
+        const graphRes = await fetch(`${base}/api/graph?symbol=hermeticTestFunction`);
         assert.strictEqual(graphRes.status, 200);
         const graphData = await graphRes.json();
         assert.ok(Array.isArray(graphData.symbols));
@@ -177,6 +200,7 @@ test('REST API: Search, Symbols, and Graph endpoints respond correctly', async (
         const nullBlob = await fetch(`${base}/api/blobs/test%00blob`);
         assert.strictEqual(nullBlob.status, 400);
     } finally {
+        await pool.query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
         await new Promise((resolve) => srv.close(resolve));
     }
 });

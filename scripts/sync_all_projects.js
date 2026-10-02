@@ -41,7 +41,6 @@ const PROJECTS = [
     'roughin-suite',
     'signet',
     'spark',
-    'vllm',
 ];
 
 // Also sync root-level dirs (relative to monorepo root)
@@ -127,7 +126,8 @@ Environment Variables:
     const EXCLUDED_SCAN = new Set([
         'archive', 'reference', 'vllm', 'vllm-hermes', 'TheAgentCompany',
         'BitNet', 'NeoVertex1', 'tabbyAPI', 'sandbox', 'scratchpad', 'scratch',
-        'node_modules', '.git', 'logs', 'dist', 'build'
+        'node_modules', '.git', 'logs', 'dist', 'build',
+        'Brain3', 'searxng', 'dbos-worker', 'LEANN'
     ]);
 
     // Discover all active project directories in HOMELAB_ROOT

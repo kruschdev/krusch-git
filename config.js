@@ -53,11 +53,11 @@ export const config = {
         port: envOr('PORT', baseConfig.server?.port, 4890)
     },
     db: {
-        host: envOr('DB_HOST', dbUrlConfig.host || baseConfig.db?.host || 'localhost', 'localhost'),
-        port: envOr('DB_PORT', dbUrlConfig.port || baseConfig.db?.port || 5432, 5432),
-        database: envOr('DB_NAME', dbUrlConfig.database || baseConfig.db?.database || 'kdcode', 'kdcode'),
-        user: envOr('DB_USER', dbUrlConfig.user || baseConfig.db?.user || 'kdcode', 'kdcode'),
-        password: envOr('DB_PASSWORD', dbUrlConfig.password || baseConfig.db?.password || 'password', 'password'),
+        host: dbUrlConfig.host || envOr('DB_HOST', baseConfig.db?.host, 'localhost'),
+        port: dbUrlConfig.port ? parseInt(dbUrlConfig.port, 10) : envOr('DB_PORT', baseConfig.db?.port, 5432),
+        database: dbUrlConfig.database || envOr('DB_NAME', baseConfig.db?.database, 'kdcode'),
+        user: dbUrlConfig.user || envOr('DB_USER', baseConfig.db?.user, 'kdcode'),
+        password: dbUrlConfig.password || envOr('DB_PASSWORD', baseConfig.db?.password, 'password'),
         poolSize: baseConfig.db?.poolSize || 10
     },
     ai: {
