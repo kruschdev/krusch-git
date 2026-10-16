@@ -87,11 +87,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "krusch_git_list_repos",
                 description: "List all available repositories stored in the database.",
+                annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: { type: "object", properties: {} }
             },
             {
                 name: "krusch_git_read_tree",
                 description: "Read the directory structure (DAG node) of a specific repository. If tree_sha/tree_id is omitted or 'HEAD', reads the root tree of the main branch.",
+                annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -106,6 +118,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "krusch_git_read_blob",
                 description: "Read the source file contents of a specific blob or file path within a repository.",
+                annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -118,6 +136,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "krusch_git_semantic_search",
                 description: "Search code files using Hybrid RRF (BM25 + pgvector), pure semantic vector, or keyword search. Results are decayed by age.",
+                annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -139,6 +163,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "krusch_git_search_symbols",
                 description: "Search for specific code symbols (functions, classes, methods, routes) across repositories with exact match boost, signatures, and line ranges.",
+                annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -155,6 +185,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "krusch_git_file_symbols",
                 description: "List all code symbols (functions, classes, methods, routes) declared inside a specific file or blob.",
+                annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -167,6 +203,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "krusch_git_dependency_graph",
                 description: "Trace symbol dependencies: retrieve outbound imports, inbound callers/dependents, and declared symbols for a specific symbol or file path.",
+                annotations: {
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false
+                },
                 inputSchema: {
                     type: "object",
                     properties: {
