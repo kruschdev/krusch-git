@@ -1,13 +1,13 @@
 # 🌳 What Makes `krusch-git` Special
 
 > **Author**: Kevin Ruschman (`kruschdev`)  
-> **Version**: v1.2.1  
+> **Version**: v1.2.2  
 > **Category**: `#AI` `#MCP` `#DeveloperTools` `#GitDAG` `#AST` `#HybridSearch` `#PostgreSQL` `#pgvector`
 
 ![krusch-git Architecture Banner](../assets/banner.png)
 
 > 💡 **Social Caption**:  
-> *Why do autonomous coding agents break large codebases? Because grep is blind to AST relationships, and naive vector RAG treats 3-year-old deprecated code the same as yesterday's refactor. What makes krusch-git v1.2.1 special? Indexing the Git DAG into PostgreSQL 16 + pgvector, zero-dependency AST symbol graphs, recursive CTE dependency walks, exponential temporal decay (e^-0.01t), and hybrid Reciprocal Rank Fusion.*
+> *Why do autonomous coding agents break large codebases? Because grep is blind to AST relationships, and naive vector RAG treats 3-year-old deprecated code the same as yesterday's refactor. What makes krusch-git v1.2.2 special? Indexing the Git DAG into PostgreSQL 16 + pgvector, pointer-slimmed AST symbol graphs, Markdown heading spines, recursive CTE dependency walks, exponential temporal decay (e^-0.01t), and hybrid Reciprocal Rank Fusion.*
 
 ---
 
@@ -61,7 +61,7 @@ It indexes local and remote Git repositories into a relational **PostgreSQL 16 +
 | **`krusch_git_read_tree`** | `(repo, tree_sha?, path?)` | Inspects directory hierarchy at any point in Git history without disk checkouts. |
 | **`krusch_git_read_blob`** | `(repo, blob_sha?, file_path?)` | Retrieves precise blob content by object hash or current branch file path. |
 | **`krusch_git_semantic_search`** | `(repo, query, limit?, recency_bias?)` | Hybrid BM25 full-text + pgvector cosine similarity with exponential temporal decay ($e^{-0.01t}$). |
-| **`krusch_git_search_symbols`** | `(repo, query, kind?)` | Authoritative AST declaration lookup across classes, functions, and interfaces. |
+| **`krusch_git_search_symbols`** | `(repo, query, symbol_type?)` | Authoritative AST declaration & Markdown section lookup across classes, functions, interfaces, and headings. |
 | **`krusch_git_file_symbols`** | `(repo, file_path)` | Extracts outline of all AST declarations, line ranges, and signatures within a file. |
 | **`krusch_git_dependency_graph`** | `(repo, symbol, depth?)` | Multi-hop recursive CTE tracing inbound callers and outbound callees to verify blast radius. |
 
@@ -129,23 +129,23 @@ erDiagram
 
 ---
 
-## 5. Pointer-Mode Resolution for Massive Repositories
+## 5. Pointer-Mode Resolution & Pointer-Slimmed Symbols
 
-Storing gigabytes of raw source text in PostgreSQL `bytea` columns creates unnecessary storage overhead for multi-gigabyte enterprise monorepos.
+Storing gigabytes of raw source text in PostgreSQL columns creates unnecessary storage overhead for multi-gigabyte enterprise monorepos.
 
-`krusch-git` provides **Pointer-Mode Resolution**:
-* For compact repositories: Blobs are cached directly in PostgreSQL for maximum portability and air-gapped isolation.
-* For enterprise monorepos: `git_objects` stores the SHA, relative file path, byte offset, and content length as a pointer. `krusch_git_read_blob` streams the content directly from disk or Git loose packfiles via `git cat-file --batch`, keeping the database lean while maintaining full indexing power.
+`krusch-git` provides **Two-Level Pointer Resolution**:
+* **Whole-File Blob Pointers**: `blobs` stores `[POINTER]:<repo>/<file_path>`. `krusch_git_read_blob` streams the content directly from disk on demand.
+* **Pointer-Slimmed Symbol Indexing (`[POINTER_TOKENS]`)**: Instead of duplicating up to 3,000 characters of raw code inside `code_symbols.content`, `sync_to_pg.js` stores a compact, deduplicated identifier token stream (`[POINTER_TOKENS] ...`) so PostgreSQL's generated `tsv` full-text index remains 100% lossless while cutting symbol table storage by >85%. When `krusch_git_search_symbols` returns top matches, `resolveSymbolSnippet()` dynamically slices `start_line..end_line` directly from disk via `resolveBlobContent()`.
 
 ---
 
-## 6. Transparent Pragmatism: Zero-Dependency AST Lexing
+## 6. Transparent Pragmatism: Zero-Dependency AST Lexing & Markdown Section Spine
 
 Heavy tree-sitter or LSP compiler wrappers require compiled native binaries (`.node`, `libclang`, `rustc`) that break across host OS architectures (Alpine Linux, macOS ARM64, Ubuntu x86_64).
 
 `krusch-git` implements a **zero-dependency AST lexing pipeline**:
-* High-performance deterministic finite-state automata (DFA) and regular expression tokenizers for JavaScript/TypeScript, Python, Go, Rust, and SQL.
-* Extracts functions, methods, classes, interfaces, exported types, and import/export declarations with line numbers and scope ranges.
+* High-performance deterministic finite-state automata (DFA) and regular expression tokenizers for JavaScript/TypeScript, Python, Go, Rust, Shell, and Markdown.
+* Extracts functions, methods, classes, interfaces, exported types, import/export declarations, and **Markdown heading sections** (`symbol_type = 'section'` with relative link `references` edges) with exact `start_line..end_line` bounds and normalized SHA-256 `symbol_hash`.
 * Runs anywhere Node.js runs without native C++ compilation steps or external binary dependencies.
 
 ---
