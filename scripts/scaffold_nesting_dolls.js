@@ -20,7 +20,7 @@ const PG_GIT_SYNC = 'node $(git rev-parse --show-toplevel)/projects/pg-git/scrip
 const ACTIVE_PROJECTS = [
   'annotated', 'berean', 'caren', 'first-things-first', 'heyjb',
   'hivemind-companion-ext', 'home-ai', 'krusch-dbos-mcp', 'krusch-agentic-mcp',
-  'krusch-infra-mcp', 'krusch-ide', 'lightmind', 'money-machine',
+  'krusch-infra-mcp', 'krusch', 'lightmind', 'money-machine',
   'perkins_snow_removal', 'pocket-lawyer', 'pocket-lawyer-marketing',
   'roughin-suite', 'signet', 'spark', 'krusch-sentinel-mcp'
 ];

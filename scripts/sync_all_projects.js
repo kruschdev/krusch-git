@@ -28,7 +28,7 @@ const PROJECTS = [
     'krusch-agentic-mcp',
     'krusch-context-mcp',
     'krusch-infra-mcp',
-    'krusch-ide',
+    'krusch',
     'krusch-git',
     'krusch-nexus',
     'krusch-cascade-router',
