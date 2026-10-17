@@ -328,13 +328,49 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
 }
 
 /**
- * Search code symbols (functions, classes, methods, routes) across repositories.
+ * Resolve exact code snippet for a symbol on demand from local disk pointer when
+ * code_symbols.content is null or stores compact '[POINTER_TOKENS]' FTS index tokens.
+ */
+export async function resolveSymbolSnippet(symbol) {
+    if (!symbol) return null;
+    const rawContent = symbol.content ? String(symbol.content) : '';
+    const isPointerTokens = rawContent.startsWith('[POINTER_TOKENS]');
+
+    if (rawContent && !isPointerTokens) {
+        return rawContent;
+    }
+
+    if (symbol.file_path && (symbol.project || symbol.repository_id)) {
+        const buf = await resolveBlobContent({
+            id: symbol.blob_id || `sym-${symbol.id || '0'}`,
+            repository_id: symbol.repository_id,
+            project: symbol.project,
+            file_path: symbol.file_path,
+            storage_mode: 'pointer'
+        });
+        if (buf) {
+            const text = buf.toString('utf-8');
+            const lines = text.split('\n');
+            const startIdx = Math.max(0, (Number(symbol.start_line) || 1) - 1);
+            const endIdx = Math.min(lines.length, Number(symbol.end_line) || (startIdx + 25));
+            return lines.slice(startIdx, endIdx).join('\n');
+        }
+    }
+
+    if (isPointerTokens) {
+        return symbol.signature || rawContent.replace(/^\[POINTER_TOKENS\]\n?/, '');
+    }
+    return symbol.signature || null;
+}
+
+/**
+ * Search code symbols (functions, classes, methods, routes, sections) across repositories.
  * Matches exact symbol names first, then prefix/substring, then full-text simple tsv.
  * 
  * @param {string} queryText - The symbol name or query.
  * @param {number} limit - Maximum symbols to return.
  * @param {number|null} repositoryId - Optional repository filter.
- * @param {object} options - Optional filters { symbol_type: 'function'|'class'|'method'|'route' }.
+ * @param {object} options - Optional filters { symbol_type: 'function'|'class'|'method'|'route'|'section' }.
  * @returns {Promise<Array>}
  */
 export async function searchSymbols(queryText, limit = 10, repositoryId = null, options = {}) {
@@ -385,7 +421,16 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
     sql += ` ORDER BY similarity DESC, s.start_line ASC LIMIT $${params.length}`;
 
     const res = await query(sql, params);
-    return res.rows;
+    const hydrated = await Promise.all(
+        res.rows.map(async (row) => {
+            if (!row.content || String(row.content).startsWith('[POINTER_TOKENS]')) {
+                const resolved = await resolveSymbolSnippet(row);
+                return { ...row, content: resolved };
+            }
+            return row;
+        })
+    );
+    return hydrated;
 }
 
 /**

@@ -1,4 +1,4 @@
-# Krusch-Git MCP Tool Reference (v1.2.0)
+# Krusch-Git MCP Tool Reference (v1.2.2)
 
 > Authoritative specification for all Model Context Protocol (MCP) tools provided by `krusch-git`.
 
@@ -97,7 +97,7 @@ Hybrid RRF (Reciprocal Rank Fusion) search across code blobs combining dense `pg
 
 ## 5. `krusch_git_search_symbols`
 
-Search extracted AST code symbols (functions, classes, methods, routes) across repositories.
+Search extracted AST code symbols (functions, classes, methods, routes) and Markdown heading sections (`section`) across repositories. Automatically hydrates live code snippets from `start_line..end_line` on disk when indexed in pointer-token mode.
 
 * **Alias**: `pg_git_search_symbols`
 * **Input Schema**:
@@ -105,8 +105,8 @@ Search extracted AST code symbols (functions, classes, methods, routes) across r
   {
     "type": "object",
     "properties": {
-      "query": { "type": "string", "description": "Symbol name or pattern to locate." },
-      "symbol_type": { "type": "string", "enum": ["function", "class", "method", "route", "all"], "default": "all" },
+      "query": { "type": "string", "description": "Symbol name, heading, or pattern to locate." },
+      "symbol_type": { "type": "string", "enum": ["function", "class", "method", "route", "type", "variable", "section"], "description": "Optional filter for symbol type." },
       "limit": { "type": "number", "default": 10 },
       "project": { "type": "string", "description": "Filter by project name." },
       "repository_id": { "type": "number", "description": "Filter by repository ID." }

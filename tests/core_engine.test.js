@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { extractSymbolsAndImports } from '../lib/ast-chunker.js';
-import { resolveBlobContent } from '../server/git-engine.js';
+import { extractSymbolsAndImports, computeSymbolHash, extractCompactSymbolTokens } from '../lib/ast-chunker.js';
+import { resolveBlobContent, resolveSymbolSnippet } from '../server/git-engine.js';
 
 test('Core Math: Temporal Exponential Decay calculation', () => {
     // Decay formula: score = cosine * exp(-0.01 * age_days)
@@ -353,5 +353,62 @@ function stop_cluster {
     assert.ok(fn2, 'Should extract stop_cluster shell function');
     assert.strictEqual(fn2.startLine, 11);
     assert.strictEqual(fn2.endLine, 14);
+    assert.ok(fn2.symbol_hash && fn2.symbol_hash.length === 64, 'Should attach SHA-256 symbol_hash');
 });
+
+test('AST Chunker: KruschNexus Markdown heading section spine and doc link edges', () => {
+    const mdFixture = `# System Architecture
+
+Overview of the stack. See [Setup Guide](docs/SETUP.md) for installation.
+
+## 1. Ingestion Pipeline
+
+Details about parsing and chunking.
+
+\`\`\`bash
+# comment inside code fence must not be parsed as heading
+npm test
+\`\`\`
+
+## 2. Pointer Resolution
+
+Details about pointer resolution and [Schema](db/schema.sql#L10).
+`;
+
+    const { symbols, imports } = extractSymbolsAndImports(mdFixture, 'README.md');
+
+    assert.strictEqual(symbols.length, 3, 'Should extract 3 markdown heading sections (ignoring # inside code fence)');
+    assert.strictEqual(symbols[0].name, 'System Architecture');
+    assert.strictEqual(symbols[0].symbol_type, 'section');
+    assert.strictEqual(symbols[1].name, '1. Ingestion Pipeline');
+    assert.strictEqual(symbols[1].startLine, 5);
+    assert.strictEqual(symbols[1].endLine, 13);
+    assert.ok(symbols[1].symbol_hash && symbols[1].symbol_hash.length === 64);
+
+    assert.strictEqual(imports.length, 2);
+    assert.ok(imports.some(i => i.targetPath === 'docs/SETUP.md' && i.relation === 'references'));
+    assert.ok(imports.some(i => i.targetPath === 'db/schema.sql' && i.relation === 'references'));
+});
+
+test('Pointer-Slimmed Symbol Hydration: extractCompactSymbolTokens and resolveSymbolSnippet', async () => {
+    const rawCode = `export async function computeCentroid(vectors, weights) {\n    const normalized = normalizeVectors(vectors);\n    return mergeWeighted(normalized, weights);\n}`;
+    const compact = extractCompactSymbolTokens(rawCode, 'export async function computeCentroid(vectors, weights)');
+    assert.ok(compact.includes('normalizeVectors'));
+    assert.ok(compact.includes('mergeWeighted'));
+    assert.strictEqual(computeSymbolHash(rawCode).length, 64);
+
+    // Resolve live lines from disk for a pointer-slimmed symbol in krusch-git
+    const hydrated = await resolveSymbolSnippet({
+        id: 1,
+        project: 'krusch-git',
+        file_path: 'server/git-engine.js',
+        start_line: 12,
+        end_line: 16,
+        signature: 'export function hashContent(buffer)',
+        content: '[POINTER_TOKENS]\nexport function hashContent buffer crypto createHash sha1'
+    });
+    assert.ok(hydrated.includes('export function hashContent(buffer)'));
+    assert.ok(hydrated.includes('createHash'));
+});
+
 

@@ -77,7 +77,7 @@ async function verifyDatabase(retries = 3, delayMs = 1000) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 const server = new Server(
-    { name: "krusch-git", version: "1.2.1" },
+    { name: "krusch-git", version: "1.2.2" },
     { capabilities: { tools: {} } }
 );
 
@@ -162,7 +162,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "krusch_git_search_symbols",
-                description: "Search for specific code symbols (functions, classes, methods, routes) across repositories with exact match boost, signatures, and line ranges.",
+                description: "Search for specific code symbols (functions, classes, methods, routes, markdown sections) across repositories with exact match boost, signatures, and line ranges.",
                 annotations: {
                     readOnlyHint: true,
                     destructiveHint: false,
@@ -172,10 +172,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 inputSchema: {
                     type: "object",
                     properties: {
-                        query: { type: "string", description: "Function, class, or symbol name to search for." },
+                        query: { type: "string", description: "Function, class, markdown heading, or symbol name to search for." },
                         repo: { type: "string", description: "Repository name to filter search." },
                         project: { type: "string", description: "Alias for repo." },
-                        symbol_type: { type: "string", enum: ["function", "class", "method", "route", "type", "variable"], description: "Optional filter for symbol type." },
+                        symbol_type: { type: "string", enum: ["function", "class", "method", "route", "type", "variable", "section"], description: "Optional filter for symbol type." },
                         limit: { type: "number", description: "Max symbols to return.", default: 10 },
                         repository_id: { type: "number", description: "Optional repository ID." }
                     },

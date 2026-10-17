@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { query, pool } from '../db/pool.js';
 import { hashContent } from '../server/git-engine.js';
 import { getEmbedding, getChunkedCentroidEmbedding, isEmbeddable, MAX_EMBED_CHARS, ollamaQueue, PRIORITY } from '../lib/embedding.js';
-import { extractSymbolsAndImports } from '../lib/ast-chunker.js';
+import { extractSymbolsAndImports, extractCompactSymbolTokens } from '../lib/ast-chunker.js';
 
 const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', 'data', 'tmp', '.gemini', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
 
@@ -84,6 +84,7 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
         
         if (symbols && symbols.length > 0) {
             await query(`DELETE FROM code_symbols WHERE blob_id = $1`, [sha]);
+            const usePointerTokens = process.env.SYMBOL_STORAGE_MODE !== 'full';
             const BATCH_SIZE = 50;
             for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
                 const batch = symbols.slice(i, i + BATCH_SIZE);
@@ -91,8 +92,11 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
                 const params = [];
                 let pIdx = 1;
                 for (const sym of batch) {
+                    const storedContent = usePointerTokens
+                        ? `[POINTER_TOKENS]\n${extractCompactSymbolTokens(sym.content, sym.signature)}`
+                        : sym.content;
                     values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8})`);
-                    params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content);
+                    params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent);
                     pIdx += 9;
                 }
                 await query(`
