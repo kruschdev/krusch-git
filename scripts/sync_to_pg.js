@@ -27,13 +27,17 @@ async function generateInlineSummary(text, fileName) {
     if (text.length < 50) return defaultSummary; // Too short for LLM
     try {
         const prompt = `Provide a concise 1-line summary of what this code does. Respond ONLY with the summary.\n\nFile: ${fileName}\n\nCode:\n${text.substring(0, 3000)}`;
-        let targetModel = process.env.OLLAMA_SUMMARY_MODEL || 'qwen2.5-coder:3b';
+        let targetModel = process.env.OLLAMA_SUMMARY_MODEL || 'qwen2.5-coder:7b';
         try {
-            const resolvedPath = path.resolve(__dirname, '../../../configs/resolved_models.json');
-            const resolvedStr = await fs.readFile(resolvedPath, 'utf8');
-            const resolved = JSON.parse(resolvedStr);
-            targetModel = process.env.OLLAMA_SUMMARY_MODEL || resolved.mappings?.fast_coding_model || targetModel;
-        } catch (err) {}
+            const resolvedPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../configs/resolved_models.json');
+            if (fsSync.existsSync(resolvedPath)) {
+                const resolvedStr = await fs.readFile(resolvedPath, 'utf8');
+                const resolved = JSON.parse(resolvedStr);
+                targetModel = process.env.OLLAMA_SUMMARY_MODEL || resolved.mappings?.fast_coding_model || targetModel;
+            }
+        } catch (err) {
+            console.warn(`[Config] Optional resolved_models.json read failed, falling back to '${targetModel}':`, err.message);
+        }
         
         const makeRequest = async (host) => {
             const controller = new AbortController();
@@ -46,7 +50,8 @@ async function generateInlineSummary(text, fileName) {
                         model: targetModel,
                         prompt: prompt,
                         stream: false,
-                        options: { num_ctx: 1024, num_predict: 80 }
+                        keep_alive: -1,
+                        options: { num_ctx: 4096, num_predict: 80 }
                     }),
                     signal: controller.signal
                 });

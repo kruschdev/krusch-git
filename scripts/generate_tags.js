@@ -9,20 +9,12 @@
  *   node scripts/generate_tags.js --project=langchainjs
  *   node scripts/generate_tags.js --project=ai --limit=500
  */
-import pg from 'pg';
+import { pool, query } from '../db/pool.js';
 import 'dotenv/config';
 
-const OLLAMA_HOST = process.env.TAG_OLLAMA_HOST || 'http://10.0.0.19:11434';
-const MODEL = process.env.TAG_MODEL || 'qwen2.5-coder:1.5b';
-const CONCURRENCY = parseInt(process.env.TAG_CONCURRENCY || '2');
-
-const pool = new pg.Pool({
-    host: process.env.DB_HOST || 'localhost',
-    port: process.env.DB_PORT || 5434,
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'kruschdb'
-});
+const OLLAMA_HOST = process.env.TAG_OLLAMA_HOST || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+const MODEL = process.env.TAG_MODEL || 'qwen2.5-coder:7b';
+const CONCURRENCY = parseInt(process.env.TAG_CONCURRENCY || '2', 10);
 
 // Repos that benefit from tagging
 const EXTERNAL_REPOS = new Set([

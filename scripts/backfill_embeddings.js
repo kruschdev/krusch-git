@@ -15,13 +15,7 @@ import { fileURLToPath } from 'url';
 import { getChunkedCentroidEmbedding, isEmbeddable } from '../lib/embedding.js';
 import { ollamaQueue } from '../lib/embedding.js';
 
-const pool = new pg.Pool({
-    host: process.env.DB_HOST || 'localhost',
-    port: process.env.DB_PORT || 5434,
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'kruschdb'
-});
+import { pool, query } from '../db/pool.js';
 
 // Homelab projects to include by default (matches sync_all_projects.js)
 const HOMELAB_REPOS = new Set([

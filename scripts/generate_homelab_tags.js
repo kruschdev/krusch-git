@@ -9,25 +9,17 @@
  *   node scripts/generate_homelab_tags.js --all
  */
 
-import pg from 'pg';
+import { pool, query } from '../db/pool.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OLLAMA_HOST = process.env.TAG_OLLAMA_HOST || 'http://localhost:11434';
+const OLLAMA_HOST = process.env.TAG_OLLAMA_HOST || process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
 const MODEL = process.env.TAG_MODEL || 'qwen2.5-coder:7b';
 const CONCURRENCY = parseInt(process.env.TAG_CONCURRENCY || '3', 10);
 const MONOREPO_ROOT = process.env.MONOREPO_ROOT || path.resolve(__dirname, '../../..');
-
-const pool = new pg.Pool({
-    host: process.env.DB_HOST || '10.0.0.144',
-    port: parseInt(process.env.DB_PORT || '5435', 10),
-    user: process.env.DB_USER || 'kruschdb',
-    password: process.env.DB_PASSWORD || 'password',
-    database: process.env.DB_NAME || 'kruschdb'
-});
 
 const SYSTEM_PROMPT = `You are an elite code architect and librarian. Given a source code file, output a JSON object with:
 - "summary": A highly precise 1-sentence description (max 140 chars) of what this file implements/does. Be specific about the domain, design pattern, or technologies used.
