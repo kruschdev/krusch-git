@@ -1,6 +1,6 @@
 # krusch-git — Agent Context & Tool Protocol
 
-> **Package**: `krusch-git` (v1.2.1)  
+> **Package**: `krusch-git` (v1.2.2 — `[POINTER_TOKENS]` AST & Markdown Section Indexing)  
 > **Role**: Git DAG, AST Chunking & Symbol Dependency Exploration Engine  
 > **Transports**: Model Context Protocol (stdio) via `server/mcp.js`
 

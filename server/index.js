@@ -7,25 +7,50 @@ import * as git from './git-engine.js';
 import { pool } from '../db/pool.js';
 import dotenv from 'dotenv';
 
-dotenv.config();
+import { ollamaQueue, getEmbeddingCacheStats } from '../lib/embedding.js';
+
+dotenv.config({ quiet: true });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    next();
+});
 app.use(cors({
     origin: process.env.NODE_ENV === 'production'
         ? false  // Same-origin only in production
         : true   // Allow all in development
 }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // Serve client static assets in production
 const clientDist = path.join(__dirname, '..', 'client', 'dist');
 app.use(express.static(clientDist));
 
 // ── API Routes ────────────────────────────────────────────────────────────────
+app.get('/api/health', async (req, res) => {
+    try {
+        await pool.query('SELECT 1');
+        res.json({
+            status: 'ok',
+            database: true,
+            queue: ollamaQueue.health(),
+            embeddingCache: getEmbeddingCacheStats()
+        });
+    } catch (err) {
+        res.status(503).json({
+            status: 'degraded',
+            database: false,
+            error: err.message
+        });
+    }
+});
+
 app.get('/api/config', (req, res) => {
     res.json({ ai: { embedModel: config.ai.embedModel } });
 });
@@ -41,8 +66,12 @@ app.get('/api/repos', async (req, res) => {
 
 app.post('/api/repos', async (req, res) => {
     try {
-        const { name, description } = req.body;
-        const repo = await git.createRepository(name, description);
+        const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+        const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+        if (!rawName || rawName.length > 128 || !/^[a-zA-Z0-9._-]+$/.test(rawName) || rawName === '.' || rawName === '..') {
+            return res.status(400).json({ error: 'Invalid repository name. Use 1-128 alphanumeric, dot, underscore, or hyphen characters.' });
+        }
+        const repo = await git.createRepository(rawName, description);
         res.json(repo);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -52,7 +81,7 @@ app.post('/api/repos', async (req, res) => {
 app.get('/api/repos/:id/tree', async (req, res) => {
     try {
         const repoId = parseInt(req.params.id, 10);
-        if (isNaN(repoId)) {
+        if (isNaN(repoId) || repoId <= 0) {
             return res.status(400).json({ error: 'Invalid repository ID' });
         }
 
@@ -71,7 +100,11 @@ app.get('/api/repos/:id/tree', async (req, res) => {
 
 app.get('/api/repos/:id/tree/:treeId', async (req, res) => {
     try {
-        const entries = await git.getTreeEntries(req.params.treeId);
+        const treeId = String(req.params.treeId || '').trim();
+        if (!treeId || treeId.includes('\0') || treeId.length > 64) {
+            return res.status(400).json({ error: 'Invalid tree ID' });
+        }
+        const entries = await git.getTreeEntries(treeId);
         res.json(entries || []);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -89,16 +122,30 @@ app.get('/api/blobs/:id', async (req, res) => {
             return res.status(404).json({ error: 'Blob not found' });
         }
         const buffer = await git.resolveBlobContent(blob);
-        if (!buffer) {
-            return res.status(500).json({ error: 'Failed to resolve blob content' });
+        let isBinary = false;
+        let content = '';
+        if (buffer) {
+            isBinary = buffer.subarray(0, 1024).includes(0);
+            if (isBinary) {
+                content = `[Binary file: ${blob.file_name || blob.id} (${buffer.length} bytes)]`;
+            } else {
+                content = buffer.toString('utf-8');
+                if (content.length > 500000) {
+                    content = content.slice(0, 500000) + `\n\n... [Content truncated: file size (${buffer.length} bytes) exceeds limit]`;
+                }
+            }
+        } else if (blob.summary) {
+            content = blob.summary;
+        } else {
+            return res.status(404).json({ error: 'Blob content unavailable on disk' });
         }
-        const isBinary = buffer.subarray(0, 1024).includes(0);
         res.json({
             id: blob.id,
             size: blob.size,
             file_name: blob.file_name,
             file_path: blob.file_path,
             is_binary: isBinary,
+            content
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -138,7 +185,7 @@ app.get('/api/search', async (req, res) => {
             }
         }
 
-        const results = await git.searchBlobs(queryText, limit, repoId, searchType);
+        const results = await git.searchBlobs(queryText, limit, repoId, { search_type: searchType });
         res.json(results || []);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -197,7 +244,7 @@ app.get('/api/graph', async (req, res) => {
             const symRes = await pool.query(
                 `SELECT file_path, repository_id FROM code_symbols 
                  WHERE symbol_name = $1 ${repoId ? 'AND repository_id = $2' : ''} 
-                 ORDER BY id ASC LIMIT 1`,
+                 ORDER BY id DESC LIMIT 1`,
                 repoId ? [symbolParam, repoId] : [symbolParam]
             );
             if (symRes.rows.length > 0) {

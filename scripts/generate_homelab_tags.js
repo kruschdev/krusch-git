@@ -39,6 +39,8 @@ async function generateTags(content, fileName) {
     const truncated = content.substring(0, 5000); // 5k chars provides ample context
     const prompt = `File: ${fileName}\n\n\`\`\`\n${truncated}\n\`\`\``;
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
     try {
         const resp = await fetch(`${OLLAMA_HOST}/api/generate`, {
             method: 'POST',
@@ -48,12 +50,15 @@ async function generateTags(content, fileName) {
                 system: SYSTEM_PROMPT,
                 prompt,
                 stream: false,
+                keep_alive: -1,
                 options: {
+                    num_ctx: 4096,
                     temperature: 0.1,
                     num_predict: 250,
                     top_p: 0.9
                 }
-            })
+            }),
+            signal: controller.signal
         });
 
         if (!resp.ok) {
@@ -80,6 +85,8 @@ async function generateTags(content, fileName) {
         };
     } catch (e) {
         return null;
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
@@ -104,13 +111,16 @@ async function processBlobs(blobs) {
             const blob = queue.shift();
             if (!blob) break;
 
-            // Resolve local path
+            // Resolve local path with strict containment guard
             const rootDirs = ['scripts', 'lib', 'lib-py', '.agent'];
-            let fullPath;
-            if (rootDirs.includes(blob.repo_name)) {
-                fullPath = path.join(MONOREPO_ROOT, blob.repo_name, blob.file_path);
-            } else {
-                fullPath = path.join(MONOREPO_ROOT, 'projects', blob.repo_name, blob.file_path);
+            const cleanRel = String(blob.file_path || '').replace(/^[/\\]+/, '');
+            const baseDir = rootDirs.includes(blob.repo_name)
+                ? path.resolve(MONOREPO_ROOT, blob.repo_name)
+                : path.resolve(MONOREPO_ROOT, 'projects', blob.repo_name);
+            const fullPath = path.resolve(baseDir, cleanRel);
+            if (!fullPath.startsWith(baseDir + path.sep)) {
+                skipped++;
+                continue;
             }
 
             let content = '';

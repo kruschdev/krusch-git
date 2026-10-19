@@ -21,7 +21,7 @@ import {
     resolveBlobContent
 } from './git-engine.js';
 
-import { getEmbedding } from '../lib/embedding.js';
+import { getEmbedding, PRIORITY } from '../lib/embedding.js';
 import { pool } from '../db/pool.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -375,7 +375,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             
             let vector = null;
             if (search_type !== "keyword") {
-                vector = await getEmbedding(searchQuery);
+                vector = await getEmbedding(searchQuery, PRIORITY.HIGH);
             }
             
             const results = await searchBlobs(searchQuery, limit, resolvedRepoId, {
@@ -416,7 +416,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             let output = `=== 🧩 Code Symbols Matching '${searchQuery}' ===\n`;
             for (const s of symbols) {
                 const proj = s.project ? `[${s.project}] ` : '';
-                output += `\n--- ${proj}${s.file_path}:${s.start_line}-${s.end_line} | ${s.symbol_type.toUpperCase()}: ${s.symbol_name} ---\n`;
+                const hashTag = s.symbol_hash ? ` | hash:${s.symbol_hash.slice(0, 12)}` : '';
+                output += `\n--- ${proj}${s.file_path}:${s.start_line}-${s.end_line} | ${s.symbol_type.toUpperCase()}: ${s.symbol_name}${hashTag} ---\n`;
                 if (s.signature) output += `Signature: ${s.signature}\n`;
                 if (s.content) {
                     const snippet = s.content.length > 300 ? s.content.substring(0, 300) + '...' : s.content;
@@ -443,12 +444,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const repoParam = repo || project;
                 const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
                 const symRes = await pool.query(`
-                    SELECT s.*, r.name AS project
+                    SELECT DISTINCT ON (s.start_line, s.symbol_name, s.symbol_type)
+                        s.*, r.name AS project
                     FROM code_symbols s
                     JOIN repositories r ON r.id = s.repository_id
                     WHERE (s.file_path = $1 OR s.file_path = $2 OR s.file_path ILIKE '%' || $1)
                       ${resolvedRepoId ? 'AND s.repository_id = $3' : ''}
-                    ORDER BY s.start_line ASC
+                    ORDER BY s.start_line ASC, s.symbol_name ASC, s.symbol_type ASC, s.id DESC
                 `, resolvedRepoId ? [cleanFilePath, file_path, resolvedRepoId] : [cleanFilePath, file_path]);
                 symbols = symRes.rows;
             }
@@ -459,7 +461,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             let output = `=== 🧩 Symbols in ${file_path || blob_id} ===\n`;
             for (const s of symbols) {
-                output += `• L${s.start_line}-L${s.end_line} [${s.symbol_type}] ${s.symbol_name}: ${s.signature || ''}\n`;
+                const hashTag = s.symbol_hash ? ` (hash:${s.symbol_hash.slice(0, 12)})` : '';
+                output += `• L${s.start_line}-L${s.end_line} [${s.symbol_type}] ${s.symbol_name}${hashTag}: ${s.signature || ''}\n`;
             }
             return { content: [{ type: "text", text: output }] };
 
@@ -480,8 +483,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!targetFilePath && targetSymbol) {
                 const symRes = await pool.query(
                     `SELECT file_path, repository_id FROM code_symbols 
-                     WHERE symbol_name = $1 ${resolvedRepoId ? 'AND repository_id = $2' : ''} 
-                     ORDER BY id ASC LIMIT 1`,
+                     WHERE LOWER(symbol_name) = LOWER($1) ${resolvedRepoId ? 'AND repository_id = $2' : ''} 
+                     ORDER BY (symbol_name = $1) DESC, id DESC LIMIT 1`,
                     resolvedRepoId ? [targetSymbol, resolvedRepoId] : [targetSymbol]
                 );
                 if (symRes.rows.length > 0) {
@@ -498,7 +501,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             if (!resolvedRepoId) {
                 const repoFind = await pool.query(
-                    `SELECT repository_id FROM code_symbols WHERE file_path = $1 OR file_path = $2 LIMIT 1`,
+                    `SELECT repository_id FROM code_symbols WHERE file_path = $1 OR file_path = $2 ORDER BY id DESC LIMIT 1`,
                     [targetFilePath, file_path]
                 );
                 if (repoFind.rows.length > 0) {
@@ -512,11 +515,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             let output = `=== 🕸️ Dependency Graph for ${targetFilePath}${targetSymbol ? ` (focus: ${targetSymbol})` : ''} ===\n\n`;
 
             if (targetSymbol) {
-                const matching = graph.symbols.filter(s => s.symbol_name === targetSymbol);
+                const matching = graph.symbols.filter(s => s.symbol_name === targetSymbol || s.symbol_name.toLowerCase() === targetSymbol.toLowerCase());
                 if (matching.length > 0) {
                     output += `🎯 Target Symbol Definition:\n`;
                     for (const m of matching) {
-                        output += `  • [${m.symbol_type.toUpperCase()}] ${m.symbol_name} (L${m.start_line}-L${m.end_line})${m.signature ? ` | ${m.signature}` : ''}\n`;
+                        const hashTag = m.symbol_hash ? ` | hash:${m.symbol_hash.slice(0, 12)}` : '';
+                        output += `  • [${m.symbol_type.toUpperCase()}] ${m.symbol_name} (L${m.start_line}-L${m.end_line})${hashTag}${m.signature ? ` | ${m.signature}` : ''}\n`;
                     }
                     output += '\n';
                 }
@@ -527,7 +531,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 output += `  (none)\n`;
             } else {
                 for (const s of graph.symbols) {
-                    output += `  • [${s.symbol_type}] ${s.symbol_name} (L${s.start_line}-L${s.end_line})\n`;
+                    const hashTag = s.symbol_hash ? ` [hash:${s.symbol_hash.slice(0, 12)}]` : '';
+                    output += `  • [${s.symbol_type}] ${s.symbol_name} (L${s.start_line}-L${s.end_line})${hashTag}\n`;
                 }
             }
 

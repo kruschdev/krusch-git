@@ -7,15 +7,15 @@ const scriptPath = path.join(__dirname, 'generate_tags.js');
 
 const nodes = [
     {
-        host: 'http://10.0.0.19:11434', // kruschgame
+        host: process.env.KRUSCH_OLLAMA_HOST || 'http://192.168.1.13:11434', // krusch
         repos: ['langchainjs', 'ai', 'typescript-sdk', 'mcp-servers', 'mastra', 'langgraphjs']
     },
     {
-        host: 'http://127.0.0.1:11434', // kruschdev
+        host: process.env.KRUSCHDEV_OLLAMA_HOST || 'http://192.168.1.240:11434', // kruschdev
         repos: ['openai-node', 'generative-ai-js', 'LlamaIndexTS', 'voltagent', 'langchain', 'agent-framework']
     },
     {
-        host: 'http://10.0.0.85:11434', // kruschserv
+        host: process.env.KRUSCHSERV_OLLAMA_HOST || 'http://192.168.1.225:11434', // kruschserv
         repos: ['ai-agents-for-beginners', 'goose-repo', 'generative-ai', 'openai-cookbook', 'beeai-framework', 'GenAI_Agents']
     }
 ];
@@ -28,8 +28,8 @@ async function runForNode(nodeConfig) {
                 env: {
                     ...process.env,
                     TAG_OLLAMA_HOST: nodeConfig.host,
-                    TAG_CONCURRENCY: '2',
-                    TAG_MODEL: 'qwen2.5-coder:1.5b'
+                    TAG_CONCURRENCY: process.env.TAG_CONCURRENCY || '2',
+                    TAG_MODEL: process.env.TAG_MODEL || 'qwen2.5-coder:7b'
                 },
                 stdio: ['ignore', 'append', 'append']
             });

@@ -59,6 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_tree_entries_tree ON tree_entries(tree_id);
 
 -- Semantic Embedding & Full-Text Extensions
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ALTER TABLE blobs ADD COLUMN IF NOT EXISTS embedding vector(1024);
 ALTER TABLE blobs ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
 ALTER TABLE blobs ADD COLUMN IF NOT EXISTS tsv tsvector 
@@ -68,8 +69,10 @@ CREATE INDEX IF NOT EXISTS blobs_embedding_idx ON blobs USING hnsw (embedding ve
 CREATE INDEX IF NOT EXISTS blobs_tsv_idx ON blobs USING gin(tsv);
 CREATE INDEX IF NOT EXISTS idx_blobs_repo_path ON blobs(repository_id, file_path);
 CREATE INDEX IF NOT EXISTS idx_blobs_repo_name ON blobs(repository_id, file_name);
+CREATE INDEX IF NOT EXISTS idx_blobs_path_trgm ON blobs USING gin (file_path gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_blobs_name_trgm ON blobs USING gin (file_name gin_trgm_ops);
 
--- Code Symbols (Functions, Classes, Methods, Routes)
+-- Code Symbols (Functions, Classes, Methods, Routes, Sections)
 CREATE TABLE IF NOT EXISTS code_symbols (
     id SERIAL PRIMARY KEY,
     blob_id VARCHAR(40) REFERENCES blobs(id) ON DELETE CASCADE,
@@ -81,6 +84,7 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     end_line INTEGER NOT NULL,
     signature TEXT,
     content TEXT,
+    symbol_hash VARCHAR(64),
     embedding vector(1024),
     tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(symbol_name, '') || ' ' || coalesce(signature, '') || ' ' || coalesce(content, ''))) STORED,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -90,6 +94,8 @@ CREATE INDEX IF NOT EXISTS idx_code_symbols_blob ON code_symbols(blob_id);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_repo_name ON code_symbols(repository_id, symbol_name);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_repo_path ON code_symbols(repository_id, file_path);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_type ON code_symbols(symbol_type);
+CREATE INDEX IF NOT EXISTS idx_code_symbols_lower_name ON code_symbols (LOWER(symbol_name));
+CREATE INDEX IF NOT EXISTS idx_code_symbols_name_trgm ON code_symbols USING gin (symbol_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_tsv ON code_symbols USING gin(tsv);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_embedding ON code_symbols USING hnsw (embedding vector_cosine_ops);
 
@@ -108,4 +114,6 @@ CREATE TABLE IF NOT EXISTS code_symbol_edges (
 CREATE INDEX IF NOT EXISTS idx_edges_source_blob ON code_symbol_edges(source_blob_id);
 CREATE INDEX IF NOT EXISTS idx_edges_repo_target ON code_symbol_edges(repository_id, target_path);
 CREATE INDEX IF NOT EXISTS idx_edges_repo_source ON code_symbol_edges(repository_id, source_path);
+CREATE INDEX IF NOT EXISTS idx_edges_target_trgm ON code_symbol_edges USING gin (target_path gin_trgm_ops);
+
 

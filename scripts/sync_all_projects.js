@@ -21,15 +21,23 @@ const PROJECTS = [
     'berean',
     'caren',
     'first-things-first',
+    'g-krusch',
     'heyjb',
     'hivemind-companion-ext',
     'home-ai',
+    'jean-sre',
     'krusch-dbos-mcp',
     'krusch-agentic-mcp',
+    'krusch-biz',
+    'krusch-bizlaw',
     'krusch-context-mcp',
+    'krusch-frontend-mcp',
+    'krusch-fs',
+    'krusch-gateway-mcp',
     'krusch-infra-mcp',
     'krusch',
     'krusch-git',
+    'krusch-law',
     'krusch-nexus',
     'krusch-cascade-router',
     'card-game-context',
@@ -143,7 +151,8 @@ Environment Variables:
 
     let allTasks;
     if (singleProject) {
-        allTasks = [{ name: singleProject, path: path.join(HOMELAB_ROOT, singleProject) }];
+        const rootDirMatch = ROOT_DIRS.find(d => d.name === singleProject);
+        allTasks = [rootDirMatch || { name: singleProject, path: path.join(HOMELAB_ROOT, singleProject) }];
     } else {
         // Union of explicit canonical projects + auto-discovered homelab projects
         const allProjectNames = Array.from(new Set([...PROJECTS, ...discoveredProjects])).sort();

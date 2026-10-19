@@ -10,6 +10,7 @@ export default function App() {
 
   // Tree state
   const [tree, setTree] = useState([]);
+  const [treePath, setTreePath] = useState([]); // [{ name, treeId }]
   const [activeBlob, setActiveBlob] = useState(null); // { id, name, path, content, size, is_binary }
 
   // Search & Symbols state
@@ -26,7 +27,7 @@ export default function App() {
   const [highlightLine, setHighlightLine] = useState(null);
 
   // Settings & Status
-  const [embedModel, setEmbedModel] = useState('nomic-embed-text');
+  const [embedModel, setEmbedModel] = useState('bge-large:latest');
   const [error, setError] = useState(null);
 
   // Initial load: config + repositories
@@ -48,16 +49,49 @@ export default function App() {
       .catch(e => setError(`Failed to load repositories: ${e.message}`));
   }, []);
 
-  // Load tree when activeRepo changes
+  // Load root tree when activeRepo changes
   useEffect(() => {
     if (activeRepo) {
       setTree([]);
+      setTreePath([]);
       fetch(`${API_BASE}/api/repos/${activeRepo.id}/tree`)
         .then(r => r.json())
         .then(d => setTree(Array.isArray(d) ? d : []))
         .catch(e => setError(`Failed to load tree: ${e.message}`));
     }
   }, [activeRepo]);
+
+  const navigateIntoSubtree = async (folderName, treeId) => {
+    if (!activeRepo || !treeId) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/repos/${activeRepo.id}/tree/${treeId}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const entries = await res.json();
+      setTree(Array.isArray(entries) ? entries : []);
+      setTreePath(prev => [...prev, { name: folderName, treeId }]);
+    } catch (err) {
+      setError(`Failed to load directory '${folderName}': ${err.message}`);
+    }
+  };
+
+  const navigateUpTree = async (targetDepth = null) => {
+    if (!activeRepo) return;
+    const nextPath = targetDepth !== null
+      ? treePath.slice(0, targetDepth)
+      : treePath.slice(0, -1);
+    try {
+      const endpoint = nextPath.length === 0
+        ? `${API_BASE}/api/repos/${activeRepo.id}/tree`
+        : `${API_BASE}/api/repos/${activeRepo.id}/tree/${nextPath[nextPath.length - 1].treeId}`;
+      const res = await fetch(endpoint);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const entries = await res.json();
+      setTree(Array.isArray(entries) ? entries : []);
+      setTreePath(nextPath);
+    } catch (err) {
+      setError(`Failed to navigate directory: ${err.message}`);
+    }
+  };
 
   // Load blob content and related graph/symbols
   const loadBlob = async (blobId, fileName, filePath, targetRepoId = null) => {
@@ -239,7 +273,7 @@ export default function App() {
 
               {sidebarMode === 'symbols' && (
                 <div className="symbol-filter-row">
-                  {['', 'function', 'class', 'route', 'type'].map(t => (
+                  {['', 'function', 'method', 'class', 'route', 'type', 'section'].map(t => (
                     <button 
                       key={t}
                       className={`type-pill ${symbolTypeFilter === t ? 'active' : ''}`}
@@ -258,23 +292,41 @@ export default function App() {
             {sidebarMode === 'tree' && (
               <div className="tree-container">
                 <div className="tree-header">
-                  <span>FILES IN {activeRepo ? activeRepo.name.toUpperCase() : 'ROOT'}</span>
+                  <span>
+                    {activeRepo ? activeRepo.name.toUpperCase() : 'ROOT'}
+                    {treePath.length > 0 ? ` / ${treePath.map(p => p.name).join(' / ')}` : ''}
+                  </span>
                   <span className="count-badge">{tree.length}</span>
                 </div>
                 <ul className="file-list">
+                  {treePath.length > 0 && (
+                    <li className="file-item" onClick={() => navigateUpTree()}>
+                      <span className="file-icon">⬅️</span>
+                      <span className="file-name">.. (up one level)</span>
+                    </li>
+                  )}
                   {tree.length === 0 ? (
                     <li className="empty-item">No entries found</li>
                   ) : (
-                    tree.map((item, idx) => (
-                      <li 
-                        key={idx}
-                        className={`file-item ${activeBlob?.name === item.name ? 'active' : ''}`}
-                        onClick={() => item.type === 'blob' && loadBlob(item.object_id, item.name, item.name)}
-                      >
-                        <span className="file-icon">{item.type === 'tree' ? '📁' : '📄'}</span>
-                        <span className="file-name">{item.name}</span>
-                      </li>
-                    ))
+                    tree.map((item, idx) => {
+                      const relPath = [...treePath.map(p => p.name), item.name].join('/');
+                      return (
+                        <li 
+                          key={idx}
+                          className={`file-item ${activeBlob?.path === relPath ? 'active' : ''}`}
+                          onClick={() => {
+                            if (item.type === 'tree') {
+                              navigateIntoSubtree(item.name, item.object_id);
+                            } else if (item.type === 'blob') {
+                              loadBlob(item.object_id, item.name, relPath);
+                            }
+                          }}
+                        >
+                          <span className="file-icon">{item.type === 'tree' ? '📁' : '📄'}</span>
+                          <span className="file-name">{item.name}</span>
+                        </li>
+                      );
+                    })
                   )}
                 </ul>
               </div>
@@ -432,8 +484,8 @@ export default function App() {
                             {graphData.imports.map((imp, idx) => (
                               <li key={idx} className="graph-edge-item">
                                 <span className="edge-target">{imp.target_path}</span>
-                                {imp.symbols && (
-                                  <span className="edge-symbols">[{imp.symbols}]</span>
+                                {Array.isArray(imp.symbols) && imp.symbols.length > 0 && (
+                                  <span className="edge-symbols">[{imp.symbols.join(', ')}]</span>
                                 )}
                               </li>
                             ))}
@@ -456,8 +508,8 @@ export default function App() {
                             {graphData.dependents.map((dep, idx) => (
                               <li key={idx} className="graph-edge-item">
                                 <span className="edge-target">{dep.source_path}</span>
-                                {dep.symbols && (
-                                  <span className="edge-symbols">[{dep.symbols}]</span>
+                                {Array.isArray(dep.symbols) && dep.symbols.length > 0 && (
+                                  <span className="edge-symbols">[{dep.symbols.join(', ')}]</span>
                                 )}
                               </li>
                             ))}

@@ -3,7 +3,8 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../db/pool.js';
-import { getEmbedding } from '../lib/embedding.js';
+import { getEmbedding, PRIORITY } from '../lib/embedding.js';
+import { computeSymbolHash } from '../lib/ast-chunker.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECTS_ROOT = path.resolve(__dirname, '..', '..');
@@ -157,34 +158,38 @@ export async function getRepoRootTree(repoId) {
  * 
  * Supports:
  * 1. queryOrVector: number[] (legacy vector) or string (text query).
- * 2. options: {
+ * 2. options: string ('hybrid' | 'semantic' | 'keyword') OR {
  *      search_type?: 'hybrid' | 'semantic' | 'keyword',
  *      query?: string,
  *      vector?: number[]
  *    }
  * 
- * Backward compatible with existing callers in krusch-context-mcp.
+ * Backward compatible with existing callers in krusch-context-mcp and REST API.
  */
 export async function searchBlobs(queryOrVector, limit = 5, repositoryId, options = {}) {
+    const normalizedOptions = typeof options === 'string'
+        ? { search_type: options }
+        : (options || {});
+
     let vector = null;
     let textQuery = null;
-    let searchType = options.search_type || 'hybrid';
+    let searchType = normalizedOptions.search_type || 'hybrid';
 
     if (Array.isArray(queryOrVector)) {
         vector = queryOrVector;
-        textQuery = options.query || null;
+        textQuery = normalizedOptions.query || null;
         if (!textQuery) {
             searchType = 'semantic';
         }
     } else if (typeof queryOrVector === 'string') {
         textQuery = queryOrVector;
-        vector = options.vector || null;
+        vector = normalizedOptions.vector || null;
     }
 
-    // Attempt to obtain vector if doing hybrid or semantic search and vector is missing
+    // Attempt to obtain vector at HIGH priority if doing hybrid or semantic search and vector is missing
     if (!vector && textQuery && searchType !== 'keyword') {
         try {
-            vector = await getEmbedding(textQuery);
+            vector = await getEmbedding(textQuery, PRIORITY.HIGH);
         } catch (e) {
             console.warn(`[searchBlobs] Embedding retrieval failed, falling back to keyword BM25: ${e.message}`);
         }
@@ -194,6 +199,8 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
     if (!vector && searchType !== 'keyword') {
         searchType = 'keyword';
     }
+
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 5, 100));
 
     // 1. HYBRID SEARCH (RRF)
     if (searchType === 'hybrid' && vector && textQuery) {
@@ -249,7 +256,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
             ORDER BY similarity DESC
             LIMIT $3;
         `;
-        const res = await query(sql, [vectorStr, repositoryId || null, limit, textQuery]);
+        const res = await query(sql, [vectorStr, repositoryId || null, safeLimit, textQuery]);
         if (res.rows.length > 0) {
             return res.rows;
         }
@@ -281,7 +288,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
             params.push(repositoryId);
             sql += ` AND b.repository_id = $${params.length}`;
         }
-        params.push(limit);
+        params.push(safeLimit);
         sql += ` ORDER BY similarity DESC LIMIT $${params.length}`;
 
         const res = await query(sql, params);
@@ -317,7 +324,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
             params.push(repositoryId);
             sql += ` AND b.repository_id = $${params.length}`;
         }
-        params.push(limit);
+        params.push(safeLimit);
         sql += ` ORDER BY similarity DESC LIMIT $${params.length}`;
 
         const res = await query(sql, params);
@@ -330,8 +337,9 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
 /**
  * Resolve exact code snippet for a symbol on demand from local disk pointer when
  * code_symbols.content is null or stores compact '[POINTER_TOKENS]' FTS index tokens.
+ * Supports an optional per-batch fileCache Map to prevent redundant disk reads.
  */
-export async function resolveSymbolSnippet(symbol) {
+export async function resolveSymbolSnippet(symbol, fileCache = null) {
     if (!symbol) return null;
     const rawContent = symbol.content ? String(symbol.content) : '';
     const isPointerTokens = rawContent.startsWith('[POINTER_TOKENS]');
@@ -341,13 +349,21 @@ export async function resolveSymbolSnippet(symbol) {
     }
 
     if (symbol.file_path && (symbol.project || symbol.repository_id)) {
-        const buf = await resolveBlobContent({
-            id: symbol.blob_id || `sym-${symbol.id || '0'}`,
-            repository_id: symbol.repository_id,
-            project: symbol.project,
-            file_path: symbol.file_path,
-            storage_mode: 'pointer'
-        });
+        const cacheKey = `${symbol.repository_id || ''}::${symbol.project || ''}::${symbol.file_path}`;
+        let buf;
+        if (fileCache && fileCache.has(cacheKey)) {
+            buf = await fileCache.get(cacheKey);
+        } else {
+            const readPromise = resolveBlobContent({
+                id: symbol.blob_id || `sym-${symbol.id || '0'}`,
+                repository_id: symbol.repository_id,
+                project: symbol.project,
+                file_path: symbol.file_path,
+                storage_mode: 'pointer'
+            });
+            if (fileCache) fileCache.set(cacheKey, readPromise);
+            buf = await readPromise;
+        }
         if (buf) {
             const text = buf.toString('utf-8');
             const lines = text.split('\n');
@@ -365,7 +381,7 @@ export async function resolveSymbolSnippet(symbol) {
 
 /**
  * Search code symbols (functions, classes, methods, routes, sections) across repositories.
- * Matches exact symbol names first, then prefix/substring, then full-text simple tsv.
+ * Matches exact symbol names first, then prefix/substring (pg_trgm), then full-text simple tsv.
  * 
  * @param {string} queryText - The symbol name or query.
  * @param {number} limit - Maximum symbols to return.
@@ -379,6 +395,7 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
 
     const symbolType = options.symbol_type || null;
     const escapedLike = rawQuery.replace(/[_%]/g, '\\$&');
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 10, 100));
     
     let sql = `
         SELECT 
@@ -393,6 +410,7 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
             s.end_line,
             s.signature,
             s.content,
+            s.symbol_hash,
             (
                 CASE 
                     WHEN LOWER(s.symbol_name) = LOWER($1) THEN 1.0
@@ -417,17 +435,32 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
         params.push(symbolType);
         sql += ` AND s.symbol_type = $${params.length}`;
     }
-    params.push(Math.max(1, Math.min(Number(limit) || 10, 100)));
-    sql += ` ORDER BY similarity DESC, s.start_line ASC LIMIT $${params.length}`;
+    params.push(safeLimit * 2);
+    sql += ` ORDER BY similarity DESC, s.id DESC, s.start_line ASC LIMIT $${params.length}`;
 
     const res = await query(sql, params);
+
+    // Deduplicate by (repository_id, file_path, symbol_name, symbol_type, start_line) keeping newest
+    const seen = new Set();
+    const uniqueRows = [];
+    for (const row of res.rows) {
+        const key = `${row.repository_id}:${row.file_path}:${row.symbol_name}:${row.symbol_type}:${row.start_line}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            uniqueRows.push(row);
+            if (uniqueRows.length >= safeLimit) break;
+        }
+    }
+
+    const fileCache = new Map();
     const hydrated = await Promise.all(
-        res.rows.map(async (row) => {
-            if (!row.content || String(row.content).startsWith('[POINTER_TOKENS]')) {
-                const resolved = await resolveSymbolSnippet(row);
-                return { ...row, content: resolved };
+        uniqueRows.map(async (row) => {
+            let content = row.content;
+            if (!content || String(content).startsWith('[POINTER_TOKENS]')) {
+                content = await resolveSymbolSnippet(row, fileCache);
             }
-            return row;
+            const symbol_hash = row.symbol_hash || computeSymbolHash(content || row.signature || row.symbol_name);
+            return { ...row, content, symbol_hash };
         })
     );
     return hydrated;
@@ -448,7 +481,10 @@ export async function getSymbolsForBlob(blobId) {
         WHERE s.blob_id = $1
         ORDER BY s.start_line ASC
     `, [blobId]);
-    return res.rows;
+    return res.rows.map(row => ({
+        ...row,
+        symbol_hash: row.symbol_hash || computeSymbolHash(row.content || row.signature || row.symbol_name)
+    }));
 }
 
 /**
@@ -465,12 +501,12 @@ export async function getSymbolGraph(filePath, repositoryId) {
         return { filePath: '', repositoryId, symbols: [], imports: [], dependents: [] };
     }
 
-    // Outbound imports
+    // Outbound imports (deduplicated by target_path + relation)
     const importsRes = await query(`
-        SELECT target_path, relation, symbols
+        SELECT DISTINCT ON (target_path, relation) target_path, relation, symbols
         FROM code_symbol_edges
         WHERE repository_id = $1 AND (source_path = $2 OR source_path = $3)
-        ORDER BY target_path ASC
+        ORDER BY target_path ASC, relation ASC, id DESC
     `, [repositoryId, cleanFilePath, filePath]);
 
     // Inbound dependents (files that import this file)
@@ -480,28 +516,29 @@ export async function getSymbolGraph(filePath, repositoryId) {
     let dependentsRes;
     if (isGeneric || !baseName) {
         dependentsRes = await query(`
-            SELECT source_path, relation, symbols
+            SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
             FROM code_symbol_edges
             WHERE repository_id = $1 
               AND (target_path = $2 OR target_path ILIKE '%' || $2)
-            ORDER BY source_path ASC
+            ORDER BY source_path ASC, relation ASC, id DESC
         `, [repositoryId, cleanFilePath]);
     } else {
         dependentsRes = await query(`
-            SELECT source_path, relation, symbols
+            SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
             FROM code_symbol_edges
             WHERE repository_id = $1 
               AND (target_path = $2 OR target_path ILIKE '%' || $2 OR target_path ILIKE '%' || $3 || '%')
-            ORDER BY source_path ASC
+            ORDER BY source_path ASC, relation ASC, id DESC
         `, [repositoryId, cleanFilePath, baseName]);
     }
 
-    // File's own symbols
+    // File's own symbols (deduplicated by symbol_name, symbol_type, start_line)
     const symbolsRes = await query(`
-        SELECT symbol_name, symbol_type, start_line, end_line, signature
+        SELECT DISTINCT ON (start_line, symbol_name, symbol_type)
+            symbol_name, symbol_type, start_line, end_line, signature, symbol_hash
         FROM code_symbols
         WHERE repository_id = $1 AND (file_path = $2 OR file_path = $3)
-        ORDER BY start_line ASC
+        ORDER BY start_line ASC, symbol_name ASC, symbol_type ASC, id DESC
     `, [repositoryId, cleanFilePath, filePath]);
 
     return {
@@ -512,5 +549,6 @@ export async function getSymbolGraph(filePath, repositoryId) {
         dependents: dependentsRes.rows
     };
 }
+
 
 

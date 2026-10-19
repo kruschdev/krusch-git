@@ -1,18 +1,25 @@
 #!/usr/bin/env node
 
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import util from 'util';
 import path from 'path';
+import crypto from 'crypto';
 import { query, pool } from '../db/pool.js';
 import { getEmbedding, isEmbeddable, MAX_EMBED_CHARS } from '../lib/embedding.js';
-
 import { extractSymbolsAndImports } from '../lib/ast-chunker.js';
 
-const execPromise = util.promisify(exec);
+const execFilePromise = util.promisify(execFile);
+const HEX_SHA_RE = /^[0-9a-f]{40}$/i;
+
+function assertValidSha(sha, label = 'Git object SHA') {
+    if (typeof sha !== 'string' || !HEX_SHA_RE.test(sha)) {
+        throw new Error(`Invalid ${label}: ${sha}`);
+    }
+}
 
 async function isGitRepo(targetDir) {
     try {
-        await execPromise('git rev-parse --is-inside-work-tree', { cwd: targetDir });
+        await execFilePromise('git', ['rev-parse', '--is-inside-work-tree'], { cwd: targetDir });
         return true;
     } catch {
         return false;
@@ -20,6 +27,7 @@ async function isGitRepo(targetDir) {
 }
 
 async function processBlob(blobHash, name, repoId, targetDir) {
+    assertValidSha(blobHash, 'blob SHA');
     const existing = await query(`SELECT id FROM blobs WHERE id = $1`, [blobHash]);
     if (existing.rows.length > 0) {
         await query(`UPDATE blobs SET last_seen_at = CURRENT_TIMESTAMP WHERE id = $1`, [blobHash]);
@@ -27,9 +35,15 @@ async function processBlob(blobHash, name, repoId, targetDir) {
     }
 
     try {
-        const { stdout } = await execPromise(`git cat-file -p ${blobHash}`, { cwd: targetDir, encoding: 'buffer', maxBuffer: 1024 * 1024 * 50 }); // 50MB max
+        const { stdout } = await execFilePromise('git', ['cat-file', '-p', blobHash], {
+            cwd: targetDir,
+            encoding: 'buffer',
+            maxBuffer: 1024 * 1024 * 50
+        }); // 50MB max
         const ext = path.extname(name).toLowerCase();
         let embeddingStr = null;
+        let parsedSymbols = [];
+        let parsedImports = [];
 
         if (isEmbeddable(ext)) {
             const text = stdout.toString('utf-8');
@@ -41,27 +55,10 @@ async function processBlob(blobHash, name, repoId, targetDir) {
                 }
             }
 
-            // Extract and index code symbols
             try {
-                const { symbols } = extractSymbolsAndImports(text, name);
-                if (symbols && symbols.length > 0) {
-                    const BATCH_SIZE = 50;
-                    for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
-                        const batch = symbols.slice(i, i + BATCH_SIZE);
-                        const values = [];
-                        const params = [];
-                        let pIdx = 1;
-                        for (const sym of batch) {
-                            values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8})`);
-                            params.push(blobHash, repoId, name, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content);
-                            pIdx += 9;
-                        }
-                        await query(`
-                            INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content)
-                            VALUES ${values.join(', ')}
-                        `, params);
-                    }
-                }
+                const extracted = extractSymbolsAndImports(text, name);
+                parsedSymbols = extracted.symbols || [];
+                parsedImports = extracted.imports || [];
             } catch (_) {}
         }
 
@@ -77,25 +74,68 @@ async function processBlob(blobHash, name, repoId, targetDir) {
                 [blobHash, repoId, stdout, stdout.length, fileName, name]
             );
         }
+
+        if (parsedSymbols.length > 0) {
+            await query(`DELETE FROM code_symbols WHERE blob_id = $1 OR (repository_id = $2 AND file_path = $3)`, [blobHash, repoId, name]);
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < parsedSymbols.length; i += BATCH_SIZE) {
+                const batch = parsedSymbols.slice(i, i + BATCH_SIZE);
+                const values = [];
+                const params = [];
+                let pIdx = 1;
+                for (const sym of batch) {
+                    const symHash = sym.symbolHash || crypto.createHash('sha256').update(sym.content || sym.signature || sym.name).digest('hex');
+                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
+                    params.push(blobHash, repoId, name, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content, symHash);
+                    pIdx += 10;
+                }
+                await query(`
+                    INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash)
+                    VALUES ${values.join(', ')}
+                `, params);
+            }
+        }
+
+        if (parsedImports.length > 0) {
+            await query(`DELETE FROM code_symbol_edges WHERE source_blob_id = $1 OR (repository_id = $2 AND source_path = $3)`, [blobHash, repoId, name]);
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < parsedImports.length; i += BATCH_SIZE) {
+                const batch = parsedImports.slice(i, i + BATCH_SIZE);
+                const values = [];
+                const params = [];
+                let pIdx = 1;
+                for (const imp of batch) {
+                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5})`);
+                    params.push(repoId, blobHash, name, imp.targetPath, imp.relation, imp.symbols);
+                    pIdx += 6;
+                }
+                await query(`
+                    INSERT INTO code_symbol_edges (repository_id, source_blob_id, source_path, target_path, relation, symbols)
+                    VALUES ${values.join(', ')}
+                `, params);
+            }
+        }
     } catch (e) {
         console.error(`Failed to process blob ${blobHash}:`, e.message);
     }
 }
 
 async function processTree(treeHash, repoId, targetDir) {
+    assertValidSha(treeHash, 'tree SHA');
     const existing = await query(`SELECT id FROM trees WHERE id = $1`, [treeHash]);
     if (existing.rows.length > 0) return;
 
     try {
-        const { stdout } = await execPromise(`git ls-tree ${treeHash}`, { cwd: targetDir });
+        const { stdout } = await execFilePromise('git', ['ls-tree', treeHash], { cwd: targetDir });
         const lines = stdout.trim().split('\n').filter(l => l.length > 0);
 
         // Insert tree first
         await query(`INSERT INTO trees (id, repository_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, [treeHash, repoId]);
 
+        const entries = [];
         for (const line of lines) {
             // Format: 100644 blob hash    filename
-            const match = line.match(/^\d+ (\w+) ([a-f0-9]{40})\t(.*)$/);
+            const match = line.match(/^\d+ (\w+) ([a-f0-9]{40})\t(.*)$/i);
             if (!match) continue;
             
             const [_, type, objectId, name] = match;
@@ -105,10 +145,23 @@ async function processTree(treeHash, repoId, targetDir) {
             } else if (type === 'blob') {
                 await processBlob(objectId, name, repoId, targetDir);
             }
+            entries.push({ type, name, objectId });
+        }
 
+        const BATCH_SIZE = 100;
+        for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+            const batch = entries.slice(i, i + BATCH_SIZE);
+            const values = [];
+            const params = [];
+            let pIdx = 1;
+            for (const entry of batch) {
+                values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3})`);
+                params.push(treeHash, entry.type, entry.name, entry.objectId);
+                pIdx += 4;
+            }
             await query(
-                `INSERT INTO tree_entries (tree_id, type, name, object_id) VALUES ($1, $2, $3, $4) ON CONFLICT (tree_id, name) DO NOTHING`,
-                [treeHash, type, name, objectId]
+                `INSERT INTO tree_entries (tree_id, type, name, object_id) VALUES ${values.join(', ')} ON CONFLICT (tree_id, name) DO NOTHING`,
+                params
             );
         }
     } catch (e) {
@@ -139,7 +192,7 @@ async function main() {
 
     // Fetch Commits
     // Format: Hash|ParentHash|AuthorName|CommitMessage
-    const { stdout: logOut } = await execPromise(`git log --reverse --format="%H|%P|%an|%s"`, { cwd: targetDir });
+    const { stdout: logOut } = await execFilePromise('git', ['log', '--reverse', '--format=%H|%P|%an|%s'], { cwd: targetDir });
     const commits = logOut.trim().split('\n').filter(l => l.length > 0);
 
     console.log(`Found ${commits.length} commits to process...`);
@@ -150,8 +203,10 @@ async function main() {
         const line = commits[i];
         const parts = line.split('|');
         const hash = parts[0];
+        assertValidSha(hash, 'commit SHA');
         // Git log parent hashes are space separated. Take the first one for simplicity.
-        const parentHash = parts[1] ? parts[1].split(' ')[0] : null; 
+        const parentHash = parts[1] ? parts[1].split(' ')[0] : null;
+        if (parentHash) assertValidSha(parentHash, 'parent commit SHA');
         const author = parts[2] || 'Unknown';
         const message = parts.slice(3).join('|') || 'No message';
 
@@ -164,8 +219,9 @@ async function main() {
         console.log(`[${i + 1}/${commits.length}] Importing commit: ${hash.substring(0, 7)} - ${message}`);
 
         // Get Tree Hash
-        const { stdout: treeOut } = await execPromise(`git show -s --format=%T ${hash}`, { cwd: targetDir });
+        const { stdout: treeOut } = await execFilePromise('git', ['show', '-s', '--format=%T', hash], { cwd: targetDir });
         const treeHash = treeOut.trim();
+        assertValidSha(treeHash, 'commit tree SHA');
 
         // Process the entire tree recursively
         await processTree(treeHash, repoId, targetDir);
@@ -182,7 +238,7 @@ async function main() {
     // Update main branch
     if (latestCommitSha) {
         // Find current branch name
-        const { stdout: branchOut } = await execPromise(`git branch --show-current`, { cwd: targetDir });
+        const { stdout: branchOut } = await execFilePromise('git', ['branch', '--show-current'], { cwd: targetDir });
         const branchName = branchOut.trim() || 'main';
 
         const branchRes = await query(`SELECT id FROM branches WHERE repository_id = $1 AND name = $2`, [repoId, branchName]);

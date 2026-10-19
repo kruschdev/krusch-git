@@ -42,9 +42,11 @@ Example output:
  * Call Ollama generate endpoint for a tagging request
  */
 async function generateTags(content, fileName) {
-    const truncated = content.substring(0, 4000); // Stay well within 1.5b context
+    const truncated = content.substring(0, 4000); // Stay well within 4096 context
     const prompt = `File: ${fileName}\n\n${truncated}`;
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
     try {
         const resp = await fetch(`${OLLAMA_HOST}/api/generate`, {
             method: 'POST',
@@ -54,12 +56,15 @@ async function generateTags(content, fileName) {
                 system: SYSTEM_PROMPT,
                 prompt,
                 stream: false,
+                keep_alive: -1,
                 options: {
+                    num_ctx: 4096,
                     temperature: 0.1,
                     num_predict: 200,
                     top_p: 0.9
                 }
-            })
+            }),
+            signal: controller.signal
         });
 
         if (!resp.ok) {
@@ -89,6 +94,8 @@ async function generateTags(content, fileName) {
     } catch (e) {
         if (e instanceof SyntaxError) return null; // JSON parse failure — skip
         throw e;
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
@@ -133,12 +140,6 @@ async function processBatch(blobs) {
             try {
                 const result = await generateTags(content, blob.file_name || 'unknown');
                 if (result) {
-                    await pool.query(
-                        `UPDATE blobs SET summary = $1 WHERE id = $2 AND summary IS NULL`,
-                        [result.summary, blob.id]
-                    );
-                    // Store tags as a JSON comment in summary for now
-                    // Future: dedicated tags column
                     const taggedSummary = `${result.summary} [${result.tags.join(', ')}]`;
                     await pool.query(
                         `UPDATE blobs SET summary = $1 WHERE id = $2`,

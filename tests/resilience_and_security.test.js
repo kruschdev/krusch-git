@@ -199,13 +199,76 @@ test('REST API: Search, Symbols, and Graph endpoints respond correctly', async (
         // 5. Null byte in blob ID returns 400
         const nullBlob = await fetch(`${base}/api/blobs/test%00blob`);
         assert.strictEqual(nullBlob.status, 400);
+
+        // 6. GET /api/blobs/:id returns hydrated content field (INV-GIT-06)
+        const blobRes = await fetch(`${base}/api/blobs/${testBlobId}`);
+        assert.strictEqual(blobRes.status, 200);
+        const blobData = await blobRes.json();
+        assert.strictEqual(blobData.id, testBlobId);
+        assert.ok('content' in blobData, 'GET /api/blobs/:id must include content property for Web UI viewer');
+
+        // 7. GET /api/health returns database, queue, and embeddingCache (INV-GIT-06 & INV-GIT-08)
+        const healthRes = await fetch(`${base}/api/health`);
+        assert.strictEqual(healthRes.status, 200);
+        const healthData = await healthRes.json();
+        assert.strictEqual(healthData.status, 'ok');
+        assert.strictEqual(healthData.database, true);
+        assert.ok(Array.isArray(healthData.queue));
+        assert.ok(healthData.embeddingCache && typeof healthData.embeddingCache.maxSize === 'number');
+
+        // 8. POST /api/repos rejects empty repository name with 400 (INV-GIT-09)
+        const badRepoRes = await fetch(`${base}/api/repos`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: '   ' })
+        });
+        assert.strictEqual(badRepoRes.status, 400);
     } finally {
         await pool.query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
         await new Promise((resolve) => srv.close(resolve));
     }
 });
 
+test('INV-GIT-07 & INV-GIT-08: Embedding LRU cache and OllamaQueue deterministic FIFO priority', async () => {
+    const { clearEmbeddingCache, getEmbeddingCacheStats } = await import('../lib/embedding.js');
+    const { OllamaQueue, PRIORITY } = await import('../lib/llm-queue.js');
+
+    clearEmbeddingCache();
+    assert.strictEqual(getEmbeddingCacheStats().size, 0);
+
+    const v1 = await getEmbedding('cache-test-query-alpha', PRIORITY.HIGH);
+    assert.strictEqual(getEmbeddingCacheStats().size, 1);
+
+    const v2 = await getEmbedding('cache-test-query-alpha', PRIORITY.HIGH);
+    assert.deepStrictEqual(v1, v2);
+    assert.strictEqual(getEmbeddingCacheStats().size, 1);
+
+    // Verify OllamaQueue FIFO ordering within identical priority and HIGH pre-empting LOW
+    const q = new OllamaQueue({ endpoints: ['http://localhost:11434'], concurrencyPerNode: 1 });
+    const order = [];
+    let unblockFirst;
+    const firstGate = new Promise((r) => { unblockFirst = r; });
+
+    const p1 = q.enqueue(async () => {
+        await firstGate;
+        order.push('first-in-flight');
+        return 1;
+    }, PRIORITY.LOW);
+
+    // Enqueue two LOW tasks and two HIGH tasks while the single worker slot is occupied
+    const pLow1 = q.enqueue(async () => { order.push('low-1'); return 2; }, PRIORITY.LOW);
+    const pLow2 = q.enqueue(async () => { order.push('low-2'); return 3; }, PRIORITY.LOW);
+    const pHigh1 = q.enqueue(async () => { order.push('high-1'); return 4; }, PRIORITY.HIGH);
+    const pHigh2 = q.enqueue(async () => { order.push('high-2'); return 5; }, PRIORITY.HIGH);
+
+    unblockFirst();
+    await Promise.all([p1, pLow1, pLow2, pHigh1, pHigh2]);
+
+    assert.deepStrictEqual(order, ['first-in-flight', 'high-1', 'high-2', 'low-1', 'low-2']);
+});
+
 after(async () => {
     await pool.end();
 });
+
 

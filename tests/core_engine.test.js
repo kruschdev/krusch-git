@@ -390,15 +390,16 @@ Details about pointer resolution and [Schema](db/schema.sql#L10).
     assert.ok(imports.some(i => i.targetPath === 'db/schema.sql' && i.relation === 'references'));
 });
 
-test('Pointer-Slimmed Symbol Hydration: extractCompactSymbolTokens and resolveSymbolSnippet', async () => {
+test('Pointer-Slimmed Symbol Hydration: extractCompactSymbolTokens, resolveSymbolSnippet, and fileCache', async () => {
     const rawCode = `export async function computeCentroid(vectors, weights) {\n    const normalized = normalizeVectors(vectors);\n    return mergeWeighted(normalized, weights);\n}`;
     const compact = extractCompactSymbolTokens(rawCode, 'export async function computeCentroid(vectors, weights)');
     assert.ok(compact.includes('normalizeVectors'));
     assert.ok(compact.includes('mergeWeighted'));
     assert.strictEqual(computeSymbolHash(rawCode).length, 64);
 
-    // Resolve live lines from disk for a pointer-slimmed symbol in krusch-git
-    const hydrated = await resolveSymbolSnippet({
+    // Resolve live lines from disk for a pointer-slimmed symbol in krusch-git with shared fileCache
+    const fileCache = new Map();
+    const hydrated1 = await resolveSymbolSnippet({
         id: 1,
         project: 'krusch-git',
         file_path: 'server/git-engine.js',
@@ -406,9 +407,73 @@ test('Pointer-Slimmed Symbol Hydration: extractCompactSymbolTokens and resolveSy
         end_line: 16,
         signature: 'export function hashContent(buffer)',
         content: '[POINTER_TOKENS]\nexport function hashContent buffer crypto createHash sha1'
-    });
-    assert.ok(hydrated.includes('export function hashContent(buffer)'));
-    assert.ok(hydrated.includes('createHash'));
+    }, fileCache);
+    assert.ok(hydrated1.includes('export function hashContent(buffer)'));
+    assert.ok(hydrated1.includes('createHash'));
+    assert.strictEqual(fileCache.size, 1, 'fileCache should cache the file lines after first read');
+
+    const hydrated2 = await resolveSymbolSnippet({
+        id: 2,
+        project: 'krusch-git',
+        file_path: 'server/git-engine.js',
+        start_line: 18,
+        end_line: 25,
+        signature: 'export async function createRepository(name, description)',
+        content: '[POINTER_TOKENS]\nexport async function createRepository name description'
+    }, fileCache);
+    assert.ok(hydrated2.includes('createRepository'));
+    assert.strictEqual(fileCache.size, 1, 'Second symbol in same file must reuse cached file lines');
 });
+
+test('INV-GIT-01 & INV-GIT-02: AST Chunker handles default object params, regex literals, and masks comments/strings', () => {
+    const trickyJs = `
+// import { fakeImport } from 'commented-out-module';
+/*
+export function commentedOutFunction() {
+    return true;
+}
+*/
+const templateStr = \`
+import { anotherFake } from 'inside-template-literal';
+export function insideTemplate() {}
+\`;
+
+export async function searchSymbols(queryStr, limit = 10, repositoryId = null, options = {}) {
+    const braceRegex = /(?:\{([^}]+)\})/;
+    const quoteRegex = /['"]/;
+    if (braceRegex.test(queryStr) || quoteRegex.test(queryStr)) {
+        return [];
+    }
+    return [{ queryStr, limit, repositoryId, options }];
+}
+
+export class HardenedParser {
+    parseWithDefaults(input, cfg = { strict: true, nested: { a: 1 } }) {
+        return { input, cfg };
+    }
+}
+`;
+
+    const { symbols, imports } = extractSymbolsAndImports(trickyJs, 'lib/tricky.js');
+
+    // Must NOT extract commented-out or string-embedded imports/functions
+    assert.strictEqual(imports.length, 0, 'Must not extract phantom imports from comments or template literals');
+    assert.ok(!symbols.some(s => s.name === 'commentedOutFunction'), 'Must not extract function inside block comment');
+    assert.ok(!symbols.some(s => s.name === 'insideTemplate'), 'Must not extract function inside template literal');
+
+    // Function with default object param `options = {}` and regex literals `/.../` must span full function body
+    const fn = symbols.find(s => s.name === 'searchSymbols');
+    assert.ok(fn, 'Should extract searchSymbols function');
+    assert.strictEqual(fn.startLine, 13);
+    assert.strictEqual(fn.endLine, 20, `Expected searchSymbols endLine to be 20, got ${fn.endLine}`);
+    assert.ok(fn.endLine > fn.startLine, 'Function with options = {} must not collapse to single line');
+
+    // Method with nested default object literal in signature must span full method body
+    const method = symbols.find(s => s.name === 'HardenedParser.parseWithDefaults');
+    assert.ok(method, 'Should extract HardenedParser.parseWithDefaults');
+    assert.strictEqual(method.startLine, 23);
+    assert.strictEqual(method.endLine, 25);
+});
+
 
 

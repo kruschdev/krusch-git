@@ -5,7 +5,7 @@ import { pool } from './pool.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-async function main() {
+export async function runMigrations() {
     const client = await pool.connect();
     try {
         console.log('Connecting to PostgreSQL database...');
@@ -30,13 +30,20 @@ async function main() {
         }
 
         console.log('Migration successful.');
-    } catch (err) {
-        console.error('Migration failed:', err.message);
-        process.exitCode = 1;
     } finally {
         client.release();
-        await pool.end();
     }
 }
 
-main();
+const isMain = process.argv[1] && (fileURLToPath(import.meta.url) === process.argv[1]);
+if (isMain) {
+    runMigrations()
+        .catch(err => {
+            console.error('Migration failed:', err.message);
+            process.exitCode = 1;
+        })
+        .finally(async () => {
+            await pool.end();
+        });
+}
+

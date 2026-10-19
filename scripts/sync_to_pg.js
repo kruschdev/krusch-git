@@ -87,8 +87,11 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
         const text = buffer.toString('utf-8');
         const { symbols, imports } = extractSymbolsAndImports(text, relativePath);
         
+        // Always purge stale symbols & edges for this (repository_id, file_path) or blob_id so historical blobs don't accumulate
+        await query(`DELETE FROM code_symbols WHERE blob_id = $1 OR (repository_id = $2 AND file_path = $3)`, [sha, repoId, relativePath]);
+        await query(`DELETE FROM code_symbol_edges WHERE source_blob_id = $1 OR (repository_id = $2 AND source_path = $3)`, [sha, repoId, relativePath]);
+
         if (symbols && symbols.length > 0) {
-            await query(`DELETE FROM code_symbols WHERE blob_id = $1`, [sha]);
             const usePointerTokens = process.env.SYMBOL_STORAGE_MODE !== 'full';
             const BATCH_SIZE = 50;
             for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
@@ -100,12 +103,13 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
                     const storedContent = usePointerTokens
                         ? `[POINTER_TOKENS]\n${extractCompactSymbolTokens(sym.content, sym.signature)}`
                         : sym.content;
-                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8})`);
-                    params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent);
-                    pIdx += 9;
+                    const symHash = sym.symbolHash || crypto.createHash('sha256').update(sym.content || sym.signature || sym.name).digest('hex');
+                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
+                    params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash);
+                    pIdx += 10;
                 }
                 await query(`
-                    INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content)
+                    INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash)
                     VALUES ${values.join(', ')}
                 `, params);
             }
@@ -113,7 +117,6 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
         }
 
         if (imports && imports.length > 0) {
-            await query(`DELETE FROM code_symbol_edges WHERE source_blob_id = $1`, [sha]);
             const BATCH_SIZE = 50;
             for (let i = 0; i < imports.length; i += BATCH_SIZE) {
                 const batch = imports.slice(i, i + BATCH_SIZE);
@@ -148,9 +151,14 @@ async function insertBlob(repoId, buffer, filePath, rootDir) {
     if (existing.rows.length > 0) {
         await query(`UPDATE blobs SET last_seen_at = CURRENT_TIMESTAMP, file_name = COALESCE(file_name, $2), file_path = COALESCE(file_path, $3) WHERE id = $1`, [sha, fileName, relativePath]);
         
-        // Also populate symbols if missing from earlier snapshots
-        const symCheck = await query(`SELECT count(*) FROM code_symbols WHERE blob_id = $1`, [sha]);
-        if (symCheck.rows[0].count === '0') {
+        // Refresh symbols if missing, if symbol_hash is missing, or if single-line brace bug (start_line = end_line for function/class/method) exists
+        const symCheck = await query(`
+            SELECT count(*)::int AS cnt,
+                   count(*) FILTER (WHERE symbol_hash IS NULL OR (symbol_type IN ('function', 'class', 'method') AND start_line = end_line))::int AS stale_cnt
+            FROM code_symbols
+            WHERE blob_id = $1 AND repository_id = $2 AND file_path = $3
+        `, [sha, repoId, relativePath]);
+        if (symCheck.rows[0].cnt === 0 || symCheck.rows[0].stale_cnt > 0) {
             await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext);
         }
 
@@ -178,13 +186,13 @@ async function insertBlob(repoId, buffer, filePath, rootDir) {
     // Pointer-based storage: summary + file_path, no full content
     if (embeddingStr) {
         await query(
-            `INSERT INTO blobs (id, repository_id, size, embedding, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4::vector, $5, $6, $7, 'pointer') ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding`,
+            `INSERT INTO blobs (id, repository_id, size, embedding, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4::vector, $5, $6, $7, 'pointer') ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding, file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, last_seen_at = CURRENT_TIMESTAMP`,
             [sha, repoId, buffer.length, embeddingStr, fileName, relativePath, summary]
         );
         syncProgress.embedded++;
     } else {
         await query(
-            `INSERT INTO blobs (id, repository_id, size, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4, $5, $6, 'pointer') ON CONFLICT (id) DO NOTHING`,
+            `INSERT INTO blobs (id, repository_id, size, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4, $5, $6, 'pointer') ON CONFLICT (id) DO UPDATE SET file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, last_seen_at = CURRENT_TIMESTAMP`,
             [sha, repoId, buffer.length, fileName, relativePath, summary]
         );
     }
@@ -307,11 +315,21 @@ async function processDirectory(dirPath, repoId, rootDir) {
     // Insert Tree if not exists
     await query(`INSERT INTO trees (id, repository_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, [treeSha, repoId]);
     
-    // Insert tree entries
-    for (const entry of entries) {
+    // Batch-insert tree entries using multi-row VALUES
+    const BATCH_SIZE = 100;
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+        const batch = entries.slice(i, i + BATCH_SIZE);
+        const values = [];
+        const params = [];
+        let pIdx = 1;
+        for (const entry of batch) {
+            values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3})`);
+            params.push(treeSha, entry.type, entry.name, entry.object_id);
+            pIdx += 4;
+        }
         await query(
-            `INSERT INTO tree_entries (tree_id, type, name, object_id) VALUES ($1, $2, $3, $4) ON CONFLICT (tree_id, name) DO NOTHING`,
-            [treeSha, entry.type, entry.name, entry.object_id]
+            `INSERT INTO tree_entries (tree_id, type, name, object_id) VALUES ${values.join(', ')} ON CONFLICT (tree_id, name) DO NOTHING`,
+            params
         );
     }
 

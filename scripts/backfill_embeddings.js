@@ -88,11 +88,28 @@ async function main() {
 
         let text = '';
         try {
-            // Projects root resides two levels up from scripts directory, i.e. '/home/kruschdev/homelab/homelab/projects'
+            // Projects root resides two levels up from scripts directory, i.e. '/home/krusch/homelab/projects'
             const projectsRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-            const absolutePath = path.resolve(projectsRoot, row.repo_name, row.file_path);
-            const contentBuffer = await fs.readFile(absolutePath);
-            text = contentBuffer.toString('utf-8');
+            const monorepoRoot = path.resolve(projectsRoot, '..');
+            const cleanRel = String(row.file_path || '').replace(/^[/\\]+/, '');
+            const projectBase = path.resolve(projectsRoot, row.repo_name);
+            const monorepoBase = path.resolve(monorepoRoot, row.repo_name);
+
+            let candidatePath = path.resolve(projectBase, cleanRel);
+            if (!candidatePath.startsWith(projectBase + path.sep)) {
+                throw new Error('Path traversal blocked');
+            }
+            try {
+                const contentBuffer = await fs.readFile(candidatePath);
+                text = contentBuffer.toString('utf-8');
+            } catch {
+                candidatePath = path.resolve(monorepoBase, cleanRel);
+                if (!candidatePath.startsWith(monorepoBase + path.sep)) {
+                    throw new Error('Path traversal blocked');
+                }
+                const contentBuffer = await fs.readFile(candidatePath);
+                text = contentBuffer.toString('utf-8');
+            }
         } catch (e) {
             // Fall back to summary if reading file from disk fails
             text = row.summary || '';
