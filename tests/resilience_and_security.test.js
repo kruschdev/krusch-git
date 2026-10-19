@@ -223,9 +223,78 @@ test('REST API: Search, Symbols, and Graph endpoints respond correctly', async (
             body: JSON.stringify({ name: '   ' })
         });
         assert.strictEqual(badRepoRes.status, 400);
+
+        // 9. POST /api/repos rejects non-loopback requests without API key with 403 (GIT-05)
+        const nonLoopbackRes = await fetch(`${base}/api/repos`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Forwarded-For': '203.0.113.42'
+            },
+            body: JSON.stringify({ name: 'unauthorized-repo' })
+        });
+        assert.strictEqual(nonLoopbackRes.status, 403);
+
+        // 10. Explicit unknown repo parameter returns 404 instead of searching all repos (GIT-07)
+        const unknownRepoRes = await fetch(`${base}/api/search?q=hermetic&repo=non-existent-repo-xyz-999`);
+        assert.strictEqual(unknownRepoRes.status, 404);
     } finally {
         await pool.query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
         await new Promise((resolve) => srv.close(resolve));
+    }
+});
+
+test('GIT-08, GIT-10 & GIT-11: Fleet topology, empty-slice fallback, pointer hydration, and relative ./index.js caller matching', async () => {
+    const { NODES } = await import('../scripts/parallel_tagger.js');
+    const { resolveSymbolSnippet, getSymbolsForBlob, getSymbolGraph } = await import('../server/git-engine.js');
+
+    // GIT-08: Default NODES targets krusch (192.168.1.13:11434) for TAG_MODEL
+    assert.ok(Array.isArray(NODES) && NODES.length >= 1);
+    assert.ok(NODES[0].host.includes('192.168.1.13:11434') || Boolean(process.env.TAG_OLLAMA_HOST));
+
+    // GIT-10: resolveSymbolSnippet falls back to signature when sliced line range is empty / out-of-bounds
+    const fallbackSnippet = await resolveSymbolSnippet({
+        id: 9999,
+        project: 'krusch-git',
+        file_path: 'bin/cli.js',
+        start_line: 9999,
+        end_line: 10005,
+        signature: 'export async function fallbackSig()',
+        content: '[POINTER_TOKENS]\nfallbackSig'
+    });
+    assert.strictEqual(fallbackSnippet, 'export async function fallbackSig()');
+
+    // GIT-10 & GIT-11: getSymbolsForBlob hydrates [POINTER_TOKENS] and getSymbolGraph matches same-dir ./index.js callers
+    const repoRes = await pool.query(
+        `INSERT INTO repositories (name, description) VALUES ($1, 'GIT-10/11 Test') RETURNING id`,
+        ['ci-git10-test-' + Date.now()]
+    );
+    const repoId = repoRes.rows[0].id;
+    const blobId = 'git10blob' + Math.random().toString(36).substring(2, 10).padEnd(31, '0');
+
+    try {
+        await pool.query(
+            `INSERT INTO blobs (id, repository_id, size, storage_mode, file_name, file_path, summary) VALUES ($1, $2, 100, 'pointer', 'index.js', 'server/index.js', 'Test index')`,
+            [blobId, repoId]
+        );
+        await pool.query(`
+            INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content)
+            VALUES ($1, $2, 'server/index.js', 'testPointerSym', 'function', 9999, 10005, 'function testPointerSym()', '[POINTER_TOKENS]\ntestPointerSym tok1 tok2')
+        `, [blobId, repoId]);
+        await pool.query(`
+            INSERT INTO code_symbol_edges (repository_id, source_blob_id, source_path, target_path, relation, symbols)
+            VALUES ($1, $2, 'server/routes.js', './index.js', 'imports', ARRAY['app'])
+        `, [repoId, blobId]);
+
+        const blobSyms = await getSymbolsForBlob(blobId);
+        assert.strictEqual(blobSyms.length, 1);
+        assert.ok(!blobSyms[0].content.startsWith('[POINTER_TOKENS]'), 'getSymbolsForBlob must hydrate [POINTER_TOKENS]');
+        assert.strictEqual(blobSyms[0].content, 'function testPointerSym()');
+
+        const graph = await getSymbolGraph('server/index.js', repoId);
+        assert.ok(graph.dependents.some(d => d.source_path === 'server/routes.js'), 'getSymbolGraph must match same-directory ./index.js caller');
+    } finally {
+        await pool.query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
     }
 });
 
@@ -270,5 +339,6 @@ test('INV-GIT-07 & INV-GIT-08: Embedding LRU cache and OllamaQueue deterministic
 after(async () => {
     await pool.end();
 });
+
 
 

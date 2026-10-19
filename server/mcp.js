@@ -278,18 +278,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 blob = await getBlob(blob_id);
             } else if (cleanFilePath) {
                 const repoParam = repo || project;
+                const hasExplicitRepo = Boolean((repoParam && String(repoParam).trim()) || (repository_id !== undefined && repository_id !== null));
                 const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
-                const blobRes = await pool.query(`
-                    SELECT b.*, r.name AS project 
-                    FROM blobs b
-                    JOIN repositories r ON b.repository_id = r.id
-                    WHERE (b.file_path = $1 OR b.file_path = $2 OR b.file_name = $1)
-                      ${resolvedRepoId ? 'AND b.repository_id = $3' : ''}
-                    ORDER BY b.last_seen_at DESC LIMIT 1
-                `, resolvedRepoId ? [cleanFilePath, file_path, resolvedRepoId] : [cleanFilePath, file_path]);
+                if (!hasExplicitRepo || resolvedRepoId) {
+                    const blobRes = await pool.query(`
+                        SELECT b.*, r.name AS project 
+                        FROM blobs b
+                        JOIN repositories r ON b.repository_id = r.id
+                        WHERE (b.file_path = $1 OR b.file_path = $2 OR b.file_name = $1)
+                          ${resolvedRepoId ? 'AND b.repository_id = $3' : ''}
+                        ORDER BY b.last_seen_at DESC LIMIT 1
+                    `, resolvedRepoId ? [cleanFilePath, file_path, resolvedRepoId] : [cleanFilePath, file_path]);
 
-                if (blobRes.rows.length > 0) {
-                    blob = blobRes.rows[0];
+                    if (blobRes.rows.length > 0) {
+                        blob = blobRes.rows[0];
+                    }
                 }
             }
 
@@ -371,16 +374,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const limit = Math.min(Math.max(1, Number(args.limit) || 5), 50);
             
             const repoParam = repo || project;
+            const hasExplicitRepo = Boolean((repoParam && String(repoParam).trim()) || (repository_id !== undefined && repository_id !== null));
             const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
+            if (hasExplicitRepo && !resolvedRepoId) {
+                throw new McpError(ErrorCode.InvalidParams, `Repository '${repoParam || repository_id}' not found.`);
+            }
             
             let vector = null;
+            let embeddingAttempted = false;
             if (search_type !== "keyword") {
+                embeddingAttempted = true;
                 vector = await getEmbedding(searchQuery, PRIORITY.HIGH);
             }
             
             const results = await searchBlobs(searchQuery, limit, resolvedRepoId, {
                 search_type,
-                vector
+                vector,
+                embeddingAttempted
             });
             
             if (results.length === 0) {
@@ -406,7 +416,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const limit = Math.min(Math.max(1, Number(args.limit) || 10), 100);
             
             const repoParam = repo || project;
+            const hasExplicitRepo = Boolean((repoParam && String(repoParam).trim()) || (repository_id !== undefined && repository_id !== null));
             const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
+            if (hasExplicitRepo && !resolvedRepoId) {
+                throw new McpError(ErrorCode.InvalidParams, `Repository '${repoParam || repository_id}' not found.`);
+            }
 
             const symbols = await searchSymbols(searchQuery, limit, resolvedRepoId, { symbol_type });
             if (symbols.length === 0) {
@@ -442,16 +456,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 symbols = await getSymbolsForBlob(blob_id);
             } else if (cleanFilePath) {
                 const repoParam = repo || project;
+                const hasExplicitRepo = Boolean((repoParam && String(repoParam).trim()) || (repository_id !== undefined && repository_id !== null));
                 const resolvedRepoId = await resolveRepoId(repoParam, repository_id);
+                if (hasExplicitRepo && !resolvedRepoId) {
+                    throw new McpError(ErrorCode.InvalidParams, `Repository '${repoParam || repository_id}' not found.`);
+                }
+                const escapedPath = cleanFilePath.replace(/[_%]/g, '\\$&');
                 const symRes = await pool.query(`
                     SELECT DISTINCT ON (s.start_line, s.symbol_name, s.symbol_type)
                         s.*, r.name AS project
                     FROM code_symbols s
                     JOIN repositories r ON r.id = s.repository_id
-                    WHERE (s.file_path = $1 OR s.file_path = $2 OR s.file_path ILIKE '%' || $1)
-                      ${resolvedRepoId ? 'AND s.repository_id = $3' : ''}
+                    WHERE (s.file_path = $1 OR s.file_path = $2 OR s.file_path ILIKE '%' || $3)
+                      ${resolvedRepoId ? 'AND s.repository_id = $4' : ''}
                     ORDER BY s.start_line ASC, s.symbol_name ASC, s.symbol_type ASC, s.id DESC
-                `, resolvedRepoId ? [cleanFilePath, file_path, resolvedRepoId] : [cleanFilePath, file_path]);
+                `, resolvedRepoId ? [cleanFilePath, file_path, escapedPath, resolvedRepoId] : [cleanFilePath, file_path, escapedPath]);
                 symbols = symRes.rows;
             }
 
@@ -470,7 +489,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { file_path, symbol, repository_id, project, repo } = args;
 
             const repoParam = repo || project;
+            const hasExplicitRepo = Boolean((repoParam && String(repoParam).trim()) || (repository_id !== undefined && repository_id !== null));
             let resolvedRepoId = await resolveRepoId(repoParam, repository_id);
+            if (hasExplicitRepo && !resolvedRepoId) {
+                throw new McpError(ErrorCode.InvalidParams, `Repository '${repoParam || repository_id}' not found.`);
+            }
 
             let targetFilePath = file_path ? String(file_path).trim().replace(/^[/\\]+/, '') : null;
             let targetSymbol = symbol ? String(symbol).trim() : null;
@@ -587,7 +610,7 @@ async function main() {
     console.error("[krusch-git] Server running on stdio");
 }
 
-const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectRun) {
     main().catch(err => {
         console.error("[Fatal]", err);
@@ -595,4 +618,5 @@ if (isDirectRun) {
     });
 }
 
-export { server, verifyDatabase };
+export { server, verifyDatabase, main };
+

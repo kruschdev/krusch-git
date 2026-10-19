@@ -69,15 +69,34 @@ async function main() {
     }
 
     await fs.mkdir(CACHE_DIR, { recursive: true });
+    const realCacheDir = await fs.realpath(CACHE_DIR);
 
     for (const doc of configData) {
-        console.log(`\nFetching ${doc.name} from ${doc.url}...`);
+        const safeDocName = path.basename(String(doc?.name || '').trim());
+        if (!safeDocName || safeDocName === '.' || safeDocName === '..' || safeDocName.includes('\0')) {
+            console.error(`Skipping invalid doc.name: ${doc?.name}`);
+            continue;
+        }
+        console.log(`\nFetching ${safeDocName} from ${doc.url}...`);
         try {
             const content = await fetchUrl(doc.url);
             console.log(`Fetched ${content.length} characters.`);
             
-            const repoDir = path.join(CACHE_DIR, doc.name);
-            await fs.rm(repoDir, { recursive: true, force: true });
+            const repoDir = path.resolve(realCacheDir, safeDocName);
+            const relToCache = path.relative(realCacheDir, repoDir);
+            if (relToCache.startsWith('..') || path.isAbsolute(relToCache) || relToCache === '') {
+                throw new Error(`Invalid repository cache directory: ${repoDir}`);
+            }
+            try {
+                const realRepoDir = await fs.realpath(repoDir);
+                const relReal = path.relative(realCacheDir, realRepoDir);
+                if (relReal.startsWith('..') || path.isAbsolute(relReal) || relReal === '') {
+                    throw new Error(`Symlink escape detected for ${repoDir}`);
+                }
+                await fs.rm(realRepoDir, { recursive: true, force: true });
+            } catch (err) {
+                if (err.code !== 'ENOENT') throw err;
+            }
             await fs.mkdir(repoDir, { recursive: true });
 
             const chunks = chunkMarkdown(content);
@@ -88,11 +107,11 @@ async function main() {
                 await fs.writeFile(chunkPath, chunks[i], 'utf-8');
             }
 
-            console.log(`Starting sync for ${doc.name}...`);
+            console.log(`Starting sync for ${safeDocName}...`);
             await runSyncToPg(repoDir);
-            console.log(`Finished processing ${doc.name}.`);
+            console.log(`Finished processing ${safeDocName}.`);
         } catch (e) {
-            console.error(`Failed to process ${doc.name}:`, e.message);
+            console.error(`Failed to process ${safeDocName}:`, e.message);
         }
     }
 

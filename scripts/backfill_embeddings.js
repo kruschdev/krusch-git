@@ -91,24 +91,34 @@ async function main() {
             // Projects root resides two levels up from scripts directory, i.e. '/home/krusch/homelab/projects'
             const projectsRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
             const monorepoRoot = path.resolve(projectsRoot, '..');
+            const safeRepoName = path.basename(String(row.repo_name || '').trim());
             const cleanRel = String(row.file_path || '').replace(/^[/\\]+/, '');
-            const projectBase = path.resolve(projectsRoot, row.repo_name);
-            const monorepoBase = path.resolve(monorepoRoot, row.repo_name);
-
-            let candidatePath = path.resolve(projectBase, cleanRel);
-            if (!candidatePath.startsWith(projectBase + path.sep)) {
-                throw new Error('Path traversal blocked');
+            if (!safeRepoName || safeRepoName === '.' || safeRepoName === '..' || !cleanRel || cleanRel.includes('\0') || safeRepoName.includes('\0')) {
+                throw new Error('Invalid repository or file path');
             }
-            try {
-                const contentBuffer = await fs.readFile(candidatePath);
-                text = contentBuffer.toString('utf-8');
-            } catch {
-                candidatePath = path.resolve(monorepoBase, cleanRel);
-                if (!candidatePath.startsWith(monorepoBase + path.sep)) {
+            const projectBase = path.resolve(projectsRoot, safeRepoName);
+            const monorepoBase = path.resolve(monorepoRoot, safeRepoName);
+
+            const readContained = async (baseDir, relPath) => {
+                const candidatePath = path.resolve(baseDir, relPath);
+                const rel = path.relative(baseDir, candidatePath);
+                if (rel.startsWith('..') || path.isAbsolute(rel) || rel === '') {
                     throw new Error('Path traversal blocked');
                 }
-                const contentBuffer = await fs.readFile(candidatePath);
-                text = contentBuffer.toString('utf-8');
+                const realBase = await fs.realpath(baseDir);
+                const realTarget = await fs.realpath(candidatePath);
+                const relReal = path.relative(realBase, realTarget);
+                if (relReal.startsWith('..') || path.isAbsolute(relReal) || relReal === '') {
+                    throw new Error('Symlink path traversal blocked');
+                }
+                const contentBuffer = await fs.readFile(realTarget);
+                return contentBuffer.toString('utf-8');
+            };
+
+            try {
+                text = await readContained(projectBase, cleanRel);
+            } catch {
+                text = await readContained(monorepoBase, cleanRel);
             }
         } catch (e) {
             // Fall back to summary if reading file from disk fails

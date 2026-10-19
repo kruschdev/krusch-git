@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { query, pool } from '../db/pool.js';
 import { hashContent } from '../server/git-engine.js';
 import { getEmbedding, getChunkedCentroidEmbedding, isEmbeddable, MAX_EMBED_CHARS, ollamaQueue, PRIORITY } from '../lib/embedding.js';
-import { extractSymbolsAndImports, extractCompactSymbolTokens } from '../lib/ast-chunker.js';
+import { extractSymbolsAndImports, extractCompactSymbolTokens, computeSymbolHash } from '../lib/ast-chunker.js';
 
 const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', 'data', 'tmp', '.gemini', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
 
@@ -81,15 +81,17 @@ async function generateInlineSummary(text, fileName) {
     }
 }
 
-async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
+export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
     if (!isEmbeddable(ext)) return;
+    const client = await pool.connect();
     try {
         const text = buffer.toString('utf-8');
         const { symbols, imports } = extractSymbolsAndImports(text, relativePath);
         
-        // Always purge stale symbols & edges for this (repository_id, file_path) or blob_id so historical blobs don't accumulate
-        await query(`DELETE FROM code_symbols WHERE blob_id = $1 OR (repository_id = $2 AND file_path = $3)`, [sha, repoId, relativePath]);
-        await query(`DELETE FROM code_symbol_edges WHERE source_blob_id = $1 OR (repository_id = $2 AND source_path = $3)`, [sha, repoId, relativePath]);
+        await client.query('BEGIN');
+        // Always purge stale symbols & edges scoped strictly to this repository
+        await client.query(`DELETE FROM code_symbols WHERE repository_id = $2 AND (blob_id = $1 OR file_path = $3)`, [sha, repoId, relativePath]);
+        await client.query(`DELETE FROM code_symbol_edges WHERE repository_id = $2 AND (source_blob_id = $1 OR source_path = $3)`, [sha, repoId, relativePath]);
 
         if (symbols && symbols.length > 0) {
             const usePointerTokens = process.env.SYMBOL_STORAGE_MODE !== 'full';
@@ -103,17 +105,16 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
                     const storedContent = usePointerTokens
                         ? `[POINTER_TOKENS]\n${extractCompactSymbolTokens(sym.content, sym.signature)}`
                         : sym.content;
-                    const symHash = sym.symbolHash || crypto.createHash('sha256').update(sym.content || sym.signature || sym.name).digest('hex');
+                    const symHash = sym.symbol_hash || sym.symbolHash || computeSymbolHash(sym.content || sym.signature || sym.name);
                     values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
                     params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash);
                     pIdx += 10;
                 }
-                await query(`
+                await client.query(`
                     INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash)
                     VALUES ${values.join(', ')}
                 `, params);
             }
-            syncProgress.symbols += symbols.length;
         }
 
         if (imports && imports.length > 0) {
@@ -128,15 +129,21 @@ async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
                     params.push(repoId, sha, relativePath, imp.targetPath, imp.relation, imp.symbols);
                     pIdx += 6;
                 }
-                await query(`
+                await client.query(`
                     INSERT INTO code_symbol_edges (repository_id, source_blob_id, source_path, target_path, relation, symbols)
                     VALUES ${values.join(', ')}
                 `, params);
             }
-            syncProgress.edges += imports.length;
         }
+
+        await client.query('COMMIT');
+        syncProgress.symbols += symbols ? symbols.length : 0;
+        syncProgress.edges += imports ? imports.length : 0;
     } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
         console.warn(`[Symbols] Failed extracting symbols for ${relativePath}: ${err.message}`);
+    } finally {
+        client.release();
     }
 }
 
@@ -434,7 +441,10 @@ Environment Variables:
     await pool.end();
 }
 
-main().catch(err => {
-    console.error('Fatal Error:', err);
-    process.exit(1);
-});
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
+if (isDirectRun) {
+    main().catch(err => {
+        console.error('Fatal Error:', err);
+        process.exit(1);
+    });
+}

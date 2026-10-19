@@ -8,4 +8,8 @@ if (majorVersion < 22) {
     process.exit(1);
 }
 
-import '../server/mcp.js';
+const { main } = await import('../server/mcp.js');
+main().catch(err => {
+    console.error('[Fatal]', err);
+    process.exit(1);
+});

@@ -1,11 +1,25 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert';
-import { server } from '../server/mcp.js';
+import { server, main } from '../server/mcp.js';
 import { pool } from '../db/pool.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 test('MCP Server: exposes canonical krusch_git_* tools and aliases pg_git_*', async () => {
+    assert.strictEqual(typeof main, 'function', 'server/mcp.js must export main() for bin/cli.js entrypoint (GIT-01)');
+
+    // Ensure krusch-git repository exists for hermetic CI environments
+    let seededRepoId = null;
+    const existingRepo = await pool.query(
+        `SELECT id FROM repositories WHERE name IN ('krusch-git', 'pg-git', 'git') LIMIT 1`
+    );
+    if (existingRepo.rows.length === 0) {
+        const ins = await pool.query(
+            `INSERT INTO repositories (name, description) VALUES ('krusch-git', 'Hermetic CI repo') RETURNING id`
+        );
+        seededRepoId = ins.rows[0].id;
+    }
+
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
     await server.connect(serverTransport);
@@ -109,9 +123,20 @@ test('MCP Server: exposes canonical krusch_git_* tools and aliases pg_git_*', as
             });
         }, /Either 'repo' \(name\) or 'repository_id' is required/);
 
+        // 11. Test explicit unknown repo rejection instead of silent cross-repo fallback (GIT-07)
+        await assert.rejects(async () => {
+            await client.callTool({
+                name: 'krusch_git_search_symbols',
+                arguments: { repo: 'non-existent-repo-xyz-999', query: 'searchBlobs' }
+            });
+        }, /Repository 'non-existent-repo-xyz-999' not found/);
+
     } finally {
         await client.close();
         await server.close();
+        if (seededRepoId) {
+            await pool.query(`DELETE FROM repositories WHERE id = $1`, [seededRepoId]);
+        }
     }
 });
 

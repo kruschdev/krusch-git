@@ -15,6 +15,60 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 
+const allowedOriginsEnv = process.env.CORS_ORIGINS || process.env.CORS_ORIGIN;
+const explicitOrigins = allowedOriginsEnv
+    ? allowedOriginsEnv.split(',').map(o => o.trim()).filter(Boolean)
+    : null;
+
+function isAllowedOrigin(origin) {
+    if (!origin) return true;
+    if (explicitOrigins) {
+        return explicitOrigins.includes('*') || explicitOrigins.includes(origin);
+    }
+    if (process.env.NODE_ENV === 'production') {
+        return false;
+    }
+    return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|192\.168\.1\.\d+|10\.0\.0\.\d+|10\.10\.10\.\d+|100\.\d+\.\d+\.\d+|([a-z0-9-]+\.)*krusch\.dev)(:\d+)?$/i.test(origin);
+}
+
+function isLoopbackAddress(addr) {
+    if (!addr) return false;
+    return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+function isAuthorizedWrite(req) {
+    const configuredKey = process.env.KRUSCH_GIT_API_KEY || process.env.API_KEY;
+    const providedKey = req.headers['x-api-key'] || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7).trim() : null);
+    if (configuredKey && providedKey) {
+        return providedKey === configuredKey;
+    }
+    if (configuredKey && process.env.REQUIRE_API_KEY_LOCAL === 'true') {
+        return false;
+    }
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        const clientIp = String(forwarded).split(',')[0].trim();
+        return isLoopbackAddress(clientIp);
+    }
+    const remoteAddr = req.socket?.remoteAddress || req.ip || '';
+    return isLoopbackAddress(remoteAddr);
+}
+
+async function resolveRepoParam(rawRepo) {
+    const trimmed = String(rawRepo || '').trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+        const id = parseInt(trimmed, 10);
+        const idRes = await pool.query('SELECT id FROM repositories WHERE id = $1 LIMIT 1', [id]);
+        return idRes.rows[0]?.id ?? null;
+    }
+    const repoRes = await pool.query(
+        'SELECT id FROM repositories WHERE name = $1 OR name = $2 OR name = $3 LIMIT 1',
+        [trimmed, trimmed === 'krusch-git' ? 'pg-git' : trimmed, trimmed.replace(/^krusch-/, '')]
+    );
+    return repoRes.rows[0]?.id ?? null;
+}
+
 // ── Middleware ─────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -22,9 +76,9 @@ app.use((req, res, next) => {
     next();
 });
 app.use(cors({
-    origin: process.env.NODE_ENV === 'production'
-        ? false  // Same-origin only in production
-        : true   // Allow all in development
+    origin: (origin, callback) => {
+        callback(null, isAllowedOrigin(origin));
+    }
 }));
 app.use(express.json({ limit: '1mb' }));
 
@@ -66,6 +120,9 @@ app.get('/api/repos', async (req, res) => {
 
 app.post('/api/repos', async (req, res) => {
     try {
+        if (!isAuthorizedWrite(req)) {
+            return res.status(403).json({ error: 'Forbidden: loopback connection or valid API key required' });
+        }
         const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
         const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
         if (!rawName || rawName.length > 128 || !/^[a-zA-Z0-9._-]+$/.test(rawName) || rawName === '.' || rawName === '..') {
@@ -91,7 +148,7 @@ app.get('/api/repos/:id/tree', async (req, res) => {
             return res.json([]);
         }
 
-        const entries = await git.getTreeEntries(rootTreeId);
+        const entries = await git.getTreeEntries(rootTreeId, repoId);
         res.json(entries || []);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -100,11 +157,15 @@ app.get('/api/repos/:id/tree', async (req, res) => {
 
 app.get('/api/repos/:id/tree/:treeId', async (req, res) => {
     try {
+        const repoId = parseInt(req.params.id, 10);
+        if (isNaN(repoId) || repoId <= 0) {
+            return res.status(400).json({ error: 'Invalid repository ID' });
+        }
         const treeId = String(req.params.treeId || '').trim();
         if (!treeId || treeId.includes('\0') || treeId.length > 64) {
             return res.status(400).json({ error: 'Invalid tree ID' });
         }
-        const entries = await git.getTreeEntries(treeId);
+        const entries = await git.getTreeEntries(treeId, repoId);
         res.json(entries || []);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -175,13 +236,11 @@ app.get('/api/search', async (req, res) => {
         const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 10, 100));
 
         let repoId = null;
-        if (req.query.repo) {
-            const rawRepo = String(req.query.repo).trim();
-            if (/^\d+$/.test(rawRepo)) {
-                repoId = parseInt(rawRepo, 10);
-            } else {
-                const repoRes = await pool.query('SELECT id FROM repositories WHERE name = $1', [rawRepo]);
-                if (repoRes.rows.length > 0) repoId = repoRes.rows[0].id;
+        const rawRepo = req.query.repo ?? req.query.project;
+        if (rawRepo !== undefined && String(rawRepo).trim() !== '') {
+            repoId = await resolveRepoParam(rawRepo);
+            if (!repoId) {
+                return res.status(404).json({ error: `Repository '${rawRepo}' not found` });
             }
         }
 
@@ -202,13 +261,11 @@ app.get('/api/symbols', async (req, res) => {
         const symbolType = req.query.type || req.query.symbol_type || null;
 
         let repoId = null;
-        if (req.query.repo) {
-            const rawRepo = String(req.query.repo).trim();
-            if (/^\d+$/.test(rawRepo)) {
-                repoId = parseInt(rawRepo, 10);
-            } else {
-                const repoRes = await pool.query('SELECT id FROM repositories WHERE name = $1', [rawRepo]);
-                if (repoRes.rows.length > 0) repoId = repoRes.rows[0].id;
+        const rawRepo = req.query.repo ?? req.query.project;
+        if (rawRepo !== undefined && String(rawRepo).trim() !== '') {
+            repoId = await resolveRepoParam(rawRepo);
+            if (!repoId) {
+                return res.status(404).json({ error: `Repository '${rawRepo}' not found` });
             }
         }
 
@@ -229,13 +286,11 @@ app.get('/api/graph', async (req, res) => {
         }
 
         let repoId = null;
-        if (req.query.repo) {
-            const rawRepo = String(req.query.repo).trim();
-            if (/^\d+$/.test(rawRepo)) {
-                repoId = parseInt(rawRepo, 10);
-            } else {
-                const repoRes = await pool.query('SELECT id FROM repositories WHERE name = $1', [rawRepo]);
-                if (repoRes.rows.length > 0) repoId = repoRes.rows[0].id;
+        const rawRepo = req.query.repo ?? req.query.project;
+        if (rawRepo !== undefined && String(rawRepo).trim() !== '') {
+            repoId = await resolveRepoParam(rawRepo);
+            if (!repoId) {
+                return res.status(404).json({ error: `Repository '${rawRepo}' not found` });
             }
         }
 

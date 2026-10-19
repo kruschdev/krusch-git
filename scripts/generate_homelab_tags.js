@@ -113,19 +113,32 @@ async function processBlobs(blobs) {
 
             // Resolve local path with strict containment guard
             const rootDirs = ['scripts', 'lib', 'lib-py', '.agent'];
+            const safeRepoName = path.basename(String(blob.repo_name || '').trim());
             const cleanRel = String(blob.file_path || '').replace(/^[/\\]+/, '');
-            const baseDir = rootDirs.includes(blob.repo_name)
-                ? path.resolve(MONOREPO_ROOT, blob.repo_name)
-                : path.resolve(MONOREPO_ROOT, 'projects', blob.repo_name);
+            if (!safeRepoName || safeRepoName === '.' || safeRepoName === '..' || !cleanRel || cleanRel.includes('\0') || safeRepoName.includes('\0')) {
+                skipped++;
+                continue;
+            }
+            const baseDir = rootDirs.includes(safeRepoName)
+                ? path.resolve(MONOREPO_ROOT, safeRepoName)
+                : path.resolve(MONOREPO_ROOT, 'projects', safeRepoName);
             const fullPath = path.resolve(baseDir, cleanRel);
-            if (!fullPath.startsWith(baseDir + path.sep)) {
+            const relToBase = path.relative(baseDir, fullPath);
+            if (relToBase.startsWith('..') || path.isAbsolute(relToBase) || relToBase === '') {
                 skipped++;
                 continue;
             }
 
             let content = '';
             try {
-                content = await fs.readFile(fullPath, 'utf-8');
+                const realBaseDir = await fs.realpath(baseDir);
+                const realFullPath = await fs.realpath(fullPath);
+                const relReal = path.relative(realBaseDir, realFullPath);
+                if (relReal.startsWith('..') || path.isAbsolute(relReal) || relReal === '') {
+                    skipped++;
+                    continue;
+                }
+                content = await fs.readFile(realFullPath, 'utf-8');
             } catch (err) {
                 skipped++;
                 continue;

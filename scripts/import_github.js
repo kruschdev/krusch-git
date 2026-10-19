@@ -6,7 +6,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { query, pool } from '../db/pool.js';
 import { getEmbedding, isEmbeddable, MAX_EMBED_CHARS } from '../lib/embedding.js';
-import { extractSymbolsAndImports } from '../lib/ast-chunker.js';
+import { extractSymbolsAndImports, computeSymbolHash } from '../lib/ast-chunker.js';
 
 const execFilePromise = util.promisify(execFile);
 const HEX_SHA_RE = /^[0-9a-f]{40}$/i;
@@ -23,6 +23,61 @@ async function isGitRepo(targetDir) {
         return true;
     } catch {
         return false;
+    }
+}
+
+export async function populateSymbolsAndEdges(blobHash, repoId, name, parsedSymbols, parsedImports) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query(`DELETE FROM code_symbols WHERE repository_id = $2 AND (blob_id = $1 OR file_path = $3)`, [blobHash, repoId, name]);
+        await client.query(`DELETE FROM code_symbol_edges WHERE repository_id = $2 AND (source_blob_id = $1 OR source_path = $3)`, [blobHash, repoId, name]);
+
+        if (parsedSymbols && parsedSymbols.length > 0) {
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < parsedSymbols.length; i += BATCH_SIZE) {
+                const batch = parsedSymbols.slice(i, i + BATCH_SIZE);
+                const values = [];
+                const params = [];
+                let pIdx = 1;
+                for (const sym of batch) {
+                    const symHash = sym.symbol_hash || sym.symbolHash || computeSymbolHash(sym.content || sym.signature || sym.name);
+                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
+                    params.push(blobHash, repoId, name, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content, symHash);
+                    pIdx += 10;
+                }
+                await client.query(`
+                    INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash)
+                    VALUES ${values.join(', ')}
+                `, params);
+            }
+        }
+
+        if (parsedImports && parsedImports.length > 0) {
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < parsedImports.length; i += BATCH_SIZE) {
+                const batch = parsedImports.slice(i, i + BATCH_SIZE);
+                const values = [];
+                const params = [];
+                let pIdx = 1;
+                for (const imp of batch) {
+                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5})`);
+                    params.push(repoId, blobHash, name, imp.targetPath, imp.relation, imp.symbols);
+                    pIdx += 6;
+                }
+                await client.query(`
+                    INSERT INTO code_symbol_edges (repository_id, source_blob_id, source_path, target_path, relation, symbols)
+                    VALUES ${values.join(', ')}
+                `, params);
+            }
+        }
+
+        await client.query('COMMIT');
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        throw err;
+    } finally {
+        client.release();
     }
 }
 
@@ -75,45 +130,8 @@ async function processBlob(blobHash, name, repoId, targetDir) {
             );
         }
 
-        if (parsedSymbols.length > 0) {
-            await query(`DELETE FROM code_symbols WHERE blob_id = $1 OR (repository_id = $2 AND file_path = $3)`, [blobHash, repoId, name]);
-            const BATCH_SIZE = 50;
-            for (let i = 0; i < parsedSymbols.length; i += BATCH_SIZE) {
-                const batch = parsedSymbols.slice(i, i + BATCH_SIZE);
-                const values = [];
-                const params = [];
-                let pIdx = 1;
-                for (const sym of batch) {
-                    const symHash = sym.symbolHash || crypto.createHash('sha256').update(sym.content || sym.signature || sym.name).digest('hex');
-                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
-                    params.push(blobHash, repoId, name, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, sym.content, symHash);
-                    pIdx += 10;
-                }
-                await query(`
-                    INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash)
-                    VALUES ${values.join(', ')}
-                `, params);
-            }
-        }
-
-        if (parsedImports.length > 0) {
-            await query(`DELETE FROM code_symbol_edges WHERE source_blob_id = $1 OR (repository_id = $2 AND source_path = $3)`, [blobHash, repoId, name]);
-            const BATCH_SIZE = 50;
-            for (let i = 0; i < parsedImports.length; i += BATCH_SIZE) {
-                const batch = parsedImports.slice(i, i + BATCH_SIZE);
-                const values = [];
-                const params = [];
-                let pIdx = 1;
-                for (const imp of batch) {
-                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5})`);
-                    params.push(repoId, blobHash, name, imp.targetPath, imp.relation, imp.symbols);
-                    pIdx += 6;
-                }
-                await query(`
-                    INSERT INTO code_symbol_edges (repository_id, source_blob_id, source_path, target_path, relation, symbols)
-                    VALUES ${values.join(', ')}
-                `, params);
-            }
+        if (isEmbeddable(ext)) {
+            await populateSymbolsAndEdges(blobHash, repoId, name, parsedSymbols, parsedImports);
         }
     } catch (e) {
         console.error(`Failed to process blob ${blobHash}:`, e.message);
@@ -253,7 +271,10 @@ async function main() {
     await pool.end();
 }
 
-main().catch(err => {
-    console.error('Fatal Error:', err);
-    process.exit(1);
-});
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
+if (isDirectRun) {
+    main().catch(err => {
+        console.error('Fatal Error:', err);
+        process.exit(1);
+    });
+}

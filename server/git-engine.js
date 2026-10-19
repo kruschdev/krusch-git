@@ -44,7 +44,16 @@ export async function insertBlob(repoId, buffer) {
     return sha;
 }
 
-export async function getTreeEntries(treeId) {
+export async function getTreeEntries(treeId, repositoryId = null) {
+    if (repositoryId !== undefined && repositoryId !== null) {
+        const res = await query(`
+            SELECT te.*
+            FROM tree_entries te
+            JOIN trees t ON te.tree_id = t.id
+            WHERE te.tree_id = $1 AND t.repository_id = $2
+        `, [treeId, repositoryId]);
+        return res.rows;
+    }
     const res = await query(`SELECT * FROM tree_entries WHERE tree_id = $1`, [treeId]);
     return res.rows;
 }
@@ -174,6 +183,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
     let vector = null;
     let textQuery = null;
     let searchType = normalizedOptions.search_type || 'hybrid';
+    const hasExplicitVectorOption = Object.prototype.hasOwnProperty.call(normalizedOptions, 'vector') || normalizedOptions.embeddingAttempted === true;
 
     if (Array.isArray(queryOrVector)) {
         vector = queryOrVector;
@@ -186,8 +196,8 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
         vector = normalizedOptions.vector || null;
     }
 
-    // Attempt to obtain vector at HIGH priority if doing hybrid or semantic search and vector is missing
-    if (!vector && textQuery && searchType !== 'keyword') {
+    // Attempt to obtain vector at HIGH priority if doing hybrid or semantic search and vector was not already attempted
+    if (!vector && !hasExplicitVectorOption && textQuery && searchType !== 'keyword') {
         try {
             vector = await getEmbedding(textQuery, PRIORITY.HIGH);
         } catch (e) {
@@ -214,6 +224,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
                 FROM blobs b
                 WHERE b.embedding IS NOT NULL
                   AND ($2::integer IS NULL OR b.repository_id = $2)
+                ORDER BY b.embedding <=> $1::vector ASC
                 LIMIT $3 * 4
             ),
             lexical_matches AS (
@@ -263,35 +274,46 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
         // If hybrid yielded 0 rows, fall through to dense search
     }
 
-    // 2. DENSE SEMANTIC SEARCH (Pure vector)
+    // 2. DENSE SEMANTIC SEARCH (Pure vector — inner ANN top-K subquery uses HNSW index blobs_embedding_idx)
     if (vector) {
         const vectorStr = `[${vector.join(',')}]`;
-        let sql = `
+        const sql = `
+            WITH ann_candidates AS (
+                SELECT 
+                    b.id,
+                    b.repository_id,
+                    b.summary,
+                    b.content,
+                    b.storage_mode,
+                    b.last_seen_at,
+                    b.created_at,
+                    b.file_name,
+                    b.file_path,
+                    (b.embedding <=> $1::vector) AS cosine_dist
+                FROM blobs b
+                WHERE b.embedding IS NOT NULL
+                  AND ($2::integer IS NULL OR b.repository_id = $2)
+                ORDER BY b.embedding <=> $1::vector ASC
+                LIMIT $3 * 4
+            )
             SELECT 
-                b.id,
-                b.repository_id,
+                c.id,
+                c.repository_id,
                 r.name AS project,
-                COALESCE(b.summary, substring(encode(b.content, 'escape') from 1 for 500)) AS summary,
-                b.storage_mode,
-                b.last_seen_at,
-                COALESCE(b.file_name, b.id) AS file_name,
-                b.file_path,
-                (1 - (b.embedding <=> $1::vector)) 
-                    * exp(-0.01 * EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(b.last_seen_at, b.created_at))) / 86400.0)
+                COALESCE(c.summary, substring(encode(c.content, 'escape') from 1 for 500)) AS summary,
+                c.storage_mode,
+                c.last_seen_at,
+                COALESCE(c.file_name, c.id) AS file_name,
+                c.file_path,
+                (1 - c.cosine_dist) 
+                    * exp(-0.01 * EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(c.last_seen_at, c.created_at))) / 86400.0)
                 AS similarity
-            FROM blobs b
-            JOIN repositories r ON r.id = b.repository_id
-            WHERE b.embedding IS NOT NULL
+            FROM ann_candidates c
+            JOIN repositories r ON r.id = c.repository_id
+            ORDER BY similarity DESC
+            LIMIT $3;
         `;
-        const params = [vectorStr];
-        if (repositoryId !== undefined && repositoryId !== null) {
-            params.push(repositoryId);
-            sql += ` AND b.repository_id = $${params.length}`;
-        }
-        params.push(safeLimit);
-        sql += ` ORDER BY similarity DESC LIMIT $${params.length}`;
-
-        const res = await query(sql, params);
+        const res = await query(sql, [vectorStr, repositoryId ?? null, safeLimit]);
         if (res.rows.length > 0 || !textQuery) {
             return res.rows;
         }
@@ -369,7 +391,10 @@ export async function resolveSymbolSnippet(symbol, fileCache = null) {
             const lines = text.split('\n');
             const startIdx = Math.max(0, (Number(symbol.start_line) || 1) - 1);
             const endIdx = Math.min(lines.length, Number(symbol.end_line) || (startIdx + 25));
-            return lines.slice(startIdx, endIdx).join('\n');
+            const sliced = lines.slice(startIdx, endIdx).join('\n');
+            if (sliced.trim().length > 0) {
+                return sliced;
+            }
         }
     }
 
@@ -481,10 +506,21 @@ export async function getSymbolsForBlob(blobId) {
         WHERE s.blob_id = $1
         ORDER BY s.start_line ASC
     `, [blobId]);
-    return res.rows.map(row => ({
-        ...row,
-        symbol_hash: row.symbol_hash || computeSymbolHash(row.content || row.signature || row.symbol_name)
-    }));
+    const fileCache = new Map();
+    return Promise.all(
+        res.rows.map(async (row) => {
+            let content = row.content;
+            if (!content || String(content).startsWith('[POINTER_TOKENS]')) {
+                content = await resolveSymbolSnippet(row, fileCache);
+            }
+            const symbol_hash = row.symbol_hash || computeSymbolHash(content || row.signature || row.symbol_name);
+            return {
+                ...row,
+                content,
+                symbol_hash
+            };
+        })
+    );
 }
 
 /**
@@ -510,26 +546,56 @@ export async function getSymbolGraph(filePath, repositoryId) {
     `, [repositoryId, cleanFilePath, filePath]);
 
     // Inbound dependents (files that import this file)
-    const baseName = path.basename(cleanFilePath, path.extname(cleanFilePath));
+    const fileBase = path.posix.basename(cleanFilePath);
+    const baseName = path.posix.basename(cleanFilePath, path.posix.extname(cleanFilePath));
+    const dirName = path.posix.dirname(cleanFilePath);
+    const escapedCleanPath = cleanFilePath.replace(/[_%]/g, '\\$&');
+    const escapedBaseName = baseName.replace(/[_%]/g, '\\$&');
     const isGeneric = ['index', 'main', 'app', 'utils', 'config', 'test', 'types', 'mod', 'lib'].includes(baseName.toLowerCase());
 
     let dependentsRes;
     if (isGeneric || !baseName) {
-        dependentsRes = await query(`
-            SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
-            FROM code_symbol_edges
-            WHERE repository_id = $1 
-              AND (target_path = $2 OR target_path ILIKE '%' || $2)
-            ORDER BY source_path ASC, relation ASC, id DESC
-        `, [repositoryId, cleanFilePath]);
+        const sameDirRelCandidates = [`./${fileBase}`, `./${baseName}`];
+        if (dirName && dirName !== '.') {
+            const escapedDirPrefix = dirName.replace(/[_%]/g, '\\$&') + '/%';
+            const dirPlusBase = `${dirName}/${baseName}`.replace(/[_%]/g, '\\$&');
+            dependentsRes = await query(`
+                SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
+                FROM code_symbol_edges
+                WHERE repository_id = $1 
+                  AND (
+                      target_path = $2
+                      OR target_path ILIKE '%' || $3
+                      OR target_path ILIKE '%' || $4
+                      OR (source_path ILIKE $5 AND target_path = ANY($6))
+                  )
+                ORDER BY source_path ASC, relation ASC, id DESC
+            `, [repositoryId, cleanFilePath, escapedCleanPath, dirPlusBase, escapedDirPrefix, sameDirRelCandidates]);
+        } else {
+            dependentsRes = await query(`
+                SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
+                FROM code_symbol_edges
+                WHERE repository_id = $1 
+                  AND (
+                      target_path = $2
+                      OR target_path ILIKE '%/' || $3
+                      OR target_path = ANY($4)
+                  )
+                ORDER BY source_path ASC, relation ASC, id DESC
+            `, [repositoryId, cleanFilePath, escapedCleanPath, sameDirRelCandidates]);
+        }
     } else {
         dependentsRes = await query(`
             SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
             FROM code_symbol_edges
             WHERE repository_id = $1 
-              AND (target_path = $2 OR target_path ILIKE '%' || $2 OR target_path ILIKE '%' || $3 || '%')
+              AND (
+                  target_path = $2
+                  OR target_path ILIKE '%' || $3
+                  OR target_path ILIKE '%' || $4 || '%'
+              )
             ORDER BY source_path ASC, relation ASC, id DESC
-        `, [repositoryId, cleanFilePath, baseName]);
+        `, [repositoryId, cleanFilePath, escapedCleanPath, escapedBaseName]);
     }
 
     // File's own symbols (deduplicated by symbol_name, symbol_type, start_line)
