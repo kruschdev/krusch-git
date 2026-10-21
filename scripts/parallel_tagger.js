@@ -11,12 +11,12 @@ const ALL_EXTERNAL_REPOS = [
     'ai-agents-for-beginners', 'goose-repo', 'generative-ai', 'openai-cookbook', 'beeai-framework', 'GenAI_Agents'
 ];
 
-// INV-GIT-05: 5-GPU Fleet Topology specialization:
-// Default exclusively to krusch (192.168.1.13:11434) for qwen2.5-coder:7b (TAG_MODEL)
-// to prevent VRAM thrashing on kruschdev (qwen3-coder-30b-moe) and kruschserv (gemma4:e4b + hermes3),
+// INV-GIT-05: Multi-GPU Fleet Topology specialization:
+// Default to local Ollama (127.0.0.1:11434) or TAG_OLLAMA_HOST for qwen2.5-coder:7b (TAG_MODEL)
+// to prevent VRAM thrashing on secondary compute nodes,
 // unless additional tag hosts are explicitly overridden via environment variables.
 function buildNodes() {
-    const primaryHost = process.env.TAG_OLLAMA_HOST || process.env.KRUSCH_OLLAMA_HOST || 'http://192.168.1.13:11434';
+    const primaryHost = process.env.TAG_OLLAMA_HOST || process.env.KRUSCH_OLLAMA_HOST || 'http://127.0.0.1:11434';
     const extraHosts = [
         process.env.KRUSCHDEV_TAG_HOST || process.env.KRUSCHDEV_OLLAMA_HOST,
         process.env.KRUSCHSERV_TAG_HOST || process.env.KRUSCHSERV_OLLAMA_HOST

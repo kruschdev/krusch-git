@@ -8,33 +8,40 @@
  *   node scripts/backfill_embeddings.js --all         # All repos including datasets
  *   node scripts/backfill_embeddings.js --project=pg-git  # Single project
  */
-import pg from 'pg';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getChunkedCentroidEmbedding, isEmbeddable } from '../lib/embedding.js';
-import { ollamaQueue } from '../lib/embedding.js';
+import { getChunkedCentroidEmbedding, isEmbeddable, ollamaQueue } from '../lib/embedding.js';
+import { pool } from '../db/pool.js';
 
-import { pool, query } from '../db/pool.js';
-
-// Homelab projects to include by default (matches sync_all_projects.js)
+// Homelab projects to include by default (matches sync_all_projects.js + 3-Tier MCP stack)
 const HOMELAB_REPOS = new Set([
     'annotated', 'agent-toolkit-for-aws', 'berean', 'caren', 'first-things-first',
-    'heyjb', 'hivemind-companion-ext', 'home-ai', 'krusch-dbos-mcp', 'krusch-agentic-mcp',
-    'krusch-context-mcp', 'krusch-infra-mcp', 'krusch', 'krusch-frontend-mcp',
-    'krusch-nexus', 'krusch-oss', 'krusch-pg-agent', 'krusch-pocketlawyer-mcp',
-    'krusch-sentinel-mcp', 'krusch-sequential-mcp', 'krusch-cascade-router', 'krusch-router',
-    'lightmind', 'money-machine', 'perkins_snow_removal', 'pg-git',
-    'pocket-lawyer', 'pocket-lawyer-marketing', 'roughin-suite', 'signet', 'spark',
-    'vllm', 'halo', 'smart-router-os', 'homelab-voice', 'homelab',
-    'scripts', 'lib', 'lib-py', '.agent'
+    'g-krusch', 'heyjb', 'hivemind-companion-ext', 'home-ai', 'jean-sre',
+    'krusch-dbos-mcp', 'krusch-agentic-mcp', 'krusch-context-mcp', 'krusch-fs',
+    'krusch-gateway-mcp', 'krusch-git', 'krusch-harness', 'krusch-infra-mcp',
+    'krusch', 'krusch-frontend-mcp', 'krusch-nexus', 'krusch-oss', 'krusch-pg-agent',
+    'krusch-pocketlawyer-mcp', 'krusch-sentinel-mcp', 'krusch-sequential-mcp',
+    'krusch-cascade-router', 'krusch-router', 'lightmind', 'money-machine',
+    'perkins_snow_removal', 'pg-git', 'pocket-lawyer', 'pocket-lawyer-marketing',
+    'roughin-suite', 'signet', 'spark', 'vllm', 'halo', 'smart-router-os',
+    'homelab-voice', 'homelab', 'scripts', 'lib', 'lib-py', '.agent'
 ]);
 
 async function main() {
     const args = process.argv.slice(2);
+    if (args.includes('--help') || args.includes('-h')) {
+        console.log('Usage: node scripts/backfill_embeddings.js [--all] [--project=<repo_name>]');
+        process.exit(0);
+    }
     const allRepos = args.includes('--all');
     const projectFlag = args.find(a => a.startsWith('--project='));
-    const projectFilter = projectFlag ? projectFlag.split('=')[1] : null;
+    const rawProjectFilter = projectFlag ? projectFlag.split('=')[1]?.trim() : null;
+    if (projectFlag && (!rawProjectFilter || !/^[a-zA-Z0-9._-]+$/.test(rawProjectFilter))) {
+        console.error(`❌ Invalid --project value: "${rawProjectFilter || ''}"`);
+        process.exit(1);
+    }
+    const projectFilter = rawProjectFilter;
 
     console.log('PG-Git Embedding Backfill');
     console.log('========================');
@@ -88,7 +95,7 @@ async function main() {
 
         let text = '';
         try {
-            // Projects root resides two levels up from scripts directory, i.e. '/home/krusch/homelab/projects'
+            // Projects root resides two levels up from scripts directory
             const projectsRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
             const monorepoRoot = path.resolve(projectsRoot, '..');
             const safeRepoName = path.basename(String(row.repo_name || '').trim());

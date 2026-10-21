@@ -248,9 +248,9 @@ test('GIT-08, GIT-10 & GIT-11: Fleet topology, empty-slice fallback, pointer hyd
     const { NODES } = await import('../scripts/parallel_tagger.js');
     const { resolveSymbolSnippet, getSymbolsForBlob, getSymbolGraph } = await import('../server/git-engine.js');
 
-    // GIT-08: Default NODES targets krusch (192.168.1.13:11434) for TAG_MODEL
+    // GIT-08: Default NODES targets local Ollama (127.0.0.1:11434) or TAG_OLLAMA_HOST for TAG_MODEL
     assert.ok(Array.isArray(NODES) && NODES.length >= 1);
-    assert.ok(NODES[0].host.includes('192.168.1.13:11434') || Boolean(process.env.TAG_OLLAMA_HOST));
+    assert.ok(NODES[0].host.includes('127.0.0.1:11434') || Boolean(process.env.TAG_OLLAMA_HOST));
 
     // GIT-10: resolveSymbolSnippet falls back to signature when sliced line range is empty / out-of-bounds
     const fallbackSnippet = await resolveSymbolSnippet({

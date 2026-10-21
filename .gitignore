@@ -17,3 +17,4 @@ sync.log
 *.db-shm
 .agent/
 knowledge-cache/
+*INFLIGHT.md
