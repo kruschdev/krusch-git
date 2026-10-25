@@ -56,7 +56,9 @@ function isAuthorizedWrite(req) {
 
 async function resolveRepoParam(rawRepo) {
     const trimmed = String(rawRepo || '').trim();
-    if (!trimmed) return null;
+    if (!trimmed || trimmed.length > 128 || trimmed.includes('\0') || !/^[a-zA-Z0-9._-]+$/.test(trimmed)) {
+        return null;
+    }
     if (/^\d+$/.test(trimmed)) {
         const id = parseInt(trimmed, 10);
         const idRes = await pool.query('SELECT id FROM repositories WHERE id = $1 LIMIT 1', [id]);
@@ -109,16 +111,16 @@ app.get('/api/config', (req, res) => {
     res.json({ ai: { embedModel: config.ai.embedModel } });
 });
 
-app.get('/api/repos', async (req, res) => {
+app.get('/api/repos', async (req, res, next) => {
     try {
         const repos = await git.getRepositories();
         res.json(repos);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-app.post('/api/repos', async (req, res) => {
+app.post('/api/repos', async (req, res, next) => {
     try {
         if (!isAuthorizedWrite(req)) {
             return res.status(403).json({ error: 'Forbidden: loopback connection or valid API key required' });
@@ -131,11 +133,11 @@ app.post('/api/repos', async (req, res) => {
         const repo = await git.createRepository(rawName, description);
         res.json(repo);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-app.get('/api/repos/:id/tree', async (req, res) => {
+app.get('/api/repos/:id/tree', async (req, res, next) => {
     try {
         const repoId = parseInt(req.params.id, 10);
         if (isNaN(repoId) || repoId <= 0) {
@@ -151,11 +153,11 @@ app.get('/api/repos/:id/tree', async (req, res) => {
         const entries = await git.getTreeEntries(rootTreeId, repoId);
         res.json(entries || []);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-app.get('/api/repos/:id/tree/:treeId', async (req, res) => {
+app.get('/api/repos/:id/tree/:treeId', async (req, res, next) => {
     try {
         const repoId = parseInt(req.params.id, 10);
         if (isNaN(repoId) || repoId <= 0) {
@@ -168,11 +170,11 @@ app.get('/api/repos/:id/tree/:treeId', async (req, res) => {
         const entries = await git.getTreeEntries(treeId, repoId);
         res.json(entries || []);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-app.get('/api/blobs/:id', async (req, res) => {
+app.get('/api/blobs/:id', async (req, res, next) => {
     try {
         const blobId = String(req.params.id || '').trim();
         if (!blobId || blobId.includes('\0')) {
@@ -209,11 +211,11 @@ app.get('/api/blobs/:id', async (req, res) => {
             content
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-app.get('/api/blobs/:id/symbols', async (req, res) => {
+app.get('/api/blobs/:id/symbols', async (req, res, next) => {
     try {
         const blobId = String(req.params.id || '').trim();
         if (!blobId || blobId.includes('\0')) {
@@ -222,13 +224,13 @@ app.get('/api/blobs/:id/symbols', async (req, res) => {
         const symbols = await git.getSymbolsForBlob(blobId);
         res.json(symbols || []);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-app.get('/api/search', async (req, res) => {
+app.get('/api/search', async (req, res, next) => {
     try {
-        const queryText = String(req.query.q || '').trim();
+        const queryText = String(req.query.q || '').replace(/\0/g, '').trim().slice(0, 1000);
         if (!queryText) {
             return res.status(400).json({ error: "Query parameter 'q' is required" });
         }
@@ -240,20 +242,24 @@ app.get('/api/search', async (req, res) => {
         if (rawRepo !== undefined && String(rawRepo).trim() !== '') {
             repoId = await resolveRepoParam(rawRepo);
             if (!repoId) {
-                return res.status(404).json({ error: `Repository '${rawRepo}' not found` });
+                const safeRepoLabel = String(rawRepo).replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 64);
+                return res.status(404).json({ error: `Repository '${safeRepoLabel}' not found` });
             }
         }
 
         const results = await git.searchBlobs(queryText, limit, repoId, { search_type: searchType });
         res.json(results || []);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        if (err instanceof TypeError) {
+            return res.status(400).json({ status: 400, error: err.message });
+        }
+        next(err);
     }
 });
 
-app.get('/api/symbols', async (req, res) => {
+app.get('/api/symbols', async (req, res, next) => {
     try {
-        const queryText = String(req.query.q || '').trim();
+        const queryText = String(req.query.q || '').replace(/\0/g, '').trim().slice(0, 1000);
         if (!queryText) {
             return res.status(400).json({ error: "Query parameter 'q' is required" });
         }
@@ -265,21 +271,22 @@ app.get('/api/symbols', async (req, res) => {
         if (rawRepo !== undefined && String(rawRepo).trim() !== '') {
             repoId = await resolveRepoParam(rawRepo);
             if (!repoId) {
-                return res.status(404).json({ error: `Repository '${rawRepo}' not found` });
+                const safeRepoLabel = String(rawRepo).replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 64);
+                return res.status(404).json({ error: `Repository '${safeRepoLabel}' not found` });
             }
         }
 
         const results = await git.searchSymbols(queryText, limit, repoId, { symbol_type: symbolType });
         res.json(results || []);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-app.get('/api/graph', async (req, res) => {
+app.get('/api/graph', async (req, res, next) => {
     try {
-        const fileParam = req.query.file ? String(req.query.file).trim().replace(/^[/\\]+/, '') : null;
-        const symbolParam = req.query.symbol ? String(req.query.symbol).trim() : null;
+        const fileParam = req.query.file ? String(req.query.file).replace(/\0/g, '').trim().replace(/^[/\\]+/, '').slice(0, 512) : null;
+        const symbolParam = req.query.symbol ? String(req.query.symbol).replace(/\0/g, '').trim().slice(0, 256) : null;
 
         if (!fileParam && !symbolParam) {
             return res.status(400).json({ error: "Either 'file' or 'symbol' query parameter is required" });
@@ -290,7 +297,8 @@ app.get('/api/graph', async (req, res) => {
         if (rawRepo !== undefined && String(rawRepo).trim() !== '') {
             repoId = await resolveRepoParam(rawRepo);
             if (!repoId) {
-                return res.status(404).json({ error: `Repository '${rawRepo}' not found` });
+                const safeRepoLabel = String(rawRepo).replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 64);
+                return res.status(404).json({ error: `Repository '${safeRepoLabel}' not found` });
             }
         }
 
@@ -317,7 +325,7 @@ app.get('/api/graph', async (req, res) => {
         const graph = await git.getSymbolGraph(targetFilePath, repoId);
         res.json(graph);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
@@ -328,6 +336,11 @@ app.use((req, res, next) => {
         return res.status(404).json({ error: 'Not found' });
     }
     res.sendFile(path.join(clientDist, 'index.html'));
+});
+
+app.use((err, req, res, _next) => {
+    console.error('[pg-git] Internal API error:', err);
+    res.status(500).json({ error: 'Internal server error' });
 });
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────

@@ -52,7 +52,7 @@ async function generateTags(content, fileName) {
                 stream: false,
                 keep_alive: -1,
                 options: {
-                    num_ctx: 4096,
+                    num_ctx: 16384,
                     temperature: 0.1,
                     num_predict: 250,
                     top_p: 0.9

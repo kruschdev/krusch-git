@@ -6,8 +6,9 @@ import path from 'path';
 import crypto from 'crypto';
 import { query, pool } from '../db/pool.js';
 import { hashContent } from '../server/git-engine.js';
-import { getEmbedding, getChunkedCentroidEmbedding, isEmbeddable, MAX_EMBED_CHARS, ollamaQueue, PRIORITY } from '../lib/embedding.js';
+import { getEmbedding, getEmbeddingsBatch, getChunkedCentroidEmbedding, isEmbeddable, MAX_EMBED_CHARS, ollamaQueue, PRIORITY } from '../lib/embedding.js';
 import { extractSymbolsAndImports, extractCompactSymbolTokens, computeSymbolHash } from '../lib/ast-chunker.js';
+import { resolveSummaryModel } from '../config/ollama.js';
 
 const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', 'data', 'tmp', '.gemini', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
 
@@ -16,7 +17,9 @@ const MAX_BINARY_SIZE = 100 * 1024; // 100KB
 /** Max file size for embeddable text files (skip massive minified bundles) */
 const MAX_EMBEDDABLE_SIZE = 500 * 1024; // 500KB
 
-let syncProgress = { processed: 0, total: 0, embedded: 0, skipped: 0, symbols: 0, edges: 0 };
+export function createSyncProgress() {
+    return { processed: 0, total: 0, embedded: 0, skipped: 0, symbols: 0, edges: 0 };
+}
 
 
 async function generateInlineSummary(text, fileName) {
@@ -27,17 +30,7 @@ async function generateInlineSummary(text, fileName) {
     if (text.length < 50) return defaultSummary; // Too short for LLM
     try {
         const prompt = `Provide a concise 1-line summary of what this code does. Respond ONLY with the summary.\n\nFile: ${fileName}\n\nCode:\n${text.substring(0, 3000)}`;
-        let targetModel = process.env.OLLAMA_SUMMARY_MODEL || 'qwen2.5-coder:7b';
-        try {
-            const resolvedPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../configs/resolved_models.json');
-            if (fsSync.existsSync(resolvedPath)) {
-                const resolvedStr = await fs.readFile(resolvedPath, 'utf8');
-                const resolved = JSON.parse(resolvedStr);
-                targetModel = process.env.OLLAMA_SUMMARY_MODEL || resolved.mappings?.fast_coding_model || targetModel;
-            }
-        } catch (err) {
-            console.warn(`[Config] Optional resolved_models.json read failed, falling back to '${targetModel}':`, err.message);
-        }
+        const targetModel = resolveSummaryModel();
         
         const makeRequest = async (host) => {
             const controller = new AbortController();
@@ -51,7 +44,7 @@ async function generateInlineSummary(text, fileName) {
                         prompt: prompt,
                         stream: false,
                         keep_alive: -1,
-                        options: { num_ctx: 4096, num_predict: 80 }
+                        options: { num_ctx: 16384, num_predict: 80 }
                     }),
                     signal: controller.signal
                 });
@@ -61,7 +54,12 @@ async function generateInlineSummary(text, fileName) {
                     if (summaryText && summaryText.length > 5) {
                         return summaryText.substring(0, 500); // safety truncation
                     }
+                } else {
+                    console.warn(`[Summary] Non-OK HTTP ${response.status} from ${host} for ${fileName}, falling back to default summary.`);
                 }
+                return defaultSummary;
+            } catch (err) {
+                console.warn(`[Summary] Request to ${host} failed for ${fileName}: ${err.message}`);
                 return defaultSummary;
             } finally {
                 clearTimeout(timeout);
@@ -81,12 +79,25 @@ async function generateInlineSummary(text, fileName) {
     }
 }
 
-export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext) {
+/**
+ * Extract AST symbols and import edges for a blob and persist them transactionally.
+ * Error-handling policy (BUG-01 / DOC-01):
+ * - On any extraction or SQL failure, the active client transaction is rolled back (`ROLLBACK`)
+ *   so partial symbol/edge state is never committed.
+ * - The error is logged via `console.error` and re-thrown to the caller so snapshot failures
+ *   are surfaced rather than silently swallowed.
+ */
+export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, options = {}) {
     if (!isEmbeddable(ext)) return;
-    const client = await pool.connect();
+    const activePool = options.poolImpl || pool;
+    const extractFn = options.extractFn || extractSymbolsAndImports;
+    const embedBatchFn = options.embedBatchFn || getEmbeddingsBatch;
+    const progress = options.progress || createSyncProgress();
+    const shouldEmbedSymbols = options.embedSymbols === true || process.env.EMBED_CODE_SYMBOLS === 'true';
+    const client = await activePool.connect();
     try {
         const text = buffer.toString('utf-8');
-        const { symbols, imports } = extractSymbolsAndImports(text, relativePath);
+        const { symbols, imports } = extractFn(text, relativePath);
         
         await client.query('BEGIN');
         // Always purge stale symbols & edges scoped strictly to this repository
@@ -101,19 +112,43 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
                 const values = [];
                 const params = [];
                 let pIdx = 1;
-                for (const sym of batch) {
-                    const storedContent = usePointerTokens
-                        ? `[POINTER_TOKENS]\n${extractCompactSymbolTokens(sym.content, sym.signature)}`
-                        : sym.content;
-                    const symHash = sym.symbol_hash || sym.symbolHash || computeSymbolHash(sym.content || sym.signature || sym.name);
-                    values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
-                    params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash);
-                    pIdx += 10;
+
+                if (shouldEmbedSymbols) {
+                    const symbolInputs = batch.map(
+                        (sym) => `${relativePath} :: ${sym.type} ${sym.name}\n${sym.signature || ''}\n${(sym.content || '').slice(0, 950)}`
+                    );
+                    const symbolVectors = await embedBatchFn(symbolInputs, PRIORITY.LOW);
+                    for (let sIdx = 0; sIdx < batch.length; sIdx++) {
+                        const sym = batch[sIdx];
+                        const storedContent = usePointerTokens
+                            ? `[POINTER_TOKENS]\n${extractCompactSymbolTokens(sym.content, sym.signature)}`
+                            : sym.content;
+                        const symHash = sym.symbol_hash || sym.symbolHash || computeSymbolHash(sym.content || sym.signature || sym.name);
+                        const vec = symbolVectors?.[sIdx];
+                        const vecStr = Array.isArray(vec) && vec.length > 0 ? `[${vec.join(',')}]` : null;
+                        values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9}, $${pIdx+10}::vector)`);
+                        params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash, vecStr);
+                        pIdx += 11;
+                    }
+                    await client.query(`
+                        INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash, embedding)
+                        VALUES ${values.join(', ')}
+                    `, params);
+                } else {
+                    for (const sym of batch) {
+                        const storedContent = usePointerTokens
+                            ? `[POINTER_TOKENS]\n${extractCompactSymbolTokens(sym.content, sym.signature)}`
+                            : sym.content;
+                        const symHash = sym.symbol_hash || sym.symbolHash || computeSymbolHash(sym.content || sym.signature || sym.name);
+                        values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
+                        params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash);
+                        pIdx += 10;
+                    }
+                    await client.query(`
+                        INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash)
+                        VALUES ${values.join(', ')}
+                    `, params);
                 }
-                await client.query(`
-                    INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash)
-                    VALUES ${values.join(', ')}
-                `, params);
             }
         }
 
@@ -137,17 +172,25 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
         }
 
         await client.query('COMMIT');
-        syncProgress.symbols += symbols ? symbols.length : 0;
-        syncProgress.edges += imports ? imports.length : 0;
+        progress.symbols += symbols ? symbols.length : 0;
+        progress.edges += imports ? imports.length : 0;
     } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (_) {}
-        console.warn(`[Symbols] Failed extracting symbols for ${relativePath}: ${err.message}`);
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error(`[Symbols] Rollback failed for ${relativePath}: ${rollbackErr.message}`);
+        }
+        console.error(`[Symbols] Failed extracting symbols for ${relativePath}: ${err.message}`);
+        throw err;
     } finally {
         client.release();
     }
 }
 
-async function insertBlob(repoId, buffer, filePath, rootDir) {
+async function insertBlob(repoId, buffer, filePath, rootDir, progress = createSyncProgress()) {
+    if (!Buffer.isBuffer(buffer) || !filePath || typeof filePath !== 'string' || filePath.includes('\0')) {
+        throw new Error(`Invalid buffer or filePath passed to insertBlob: ${String(filePath)}`);
+    }
     const sha = hashContent(buffer);
     const ext = path.extname(filePath).toLowerCase();
     const fileName = path.basename(filePath);
@@ -158,15 +201,26 @@ async function insertBlob(repoId, buffer, filePath, rootDir) {
     if (existing.rows.length > 0) {
         await query(`UPDATE blobs SET last_seen_at = CURRENT_TIMESTAMP, file_name = COALESCE(file_name, $2), file_path = COALESCE(file_path, $3) WHERE id = $1`, [sha, fileName, relativePath]);
         
-        // Refresh symbols if missing, if symbol_hash is missing, or if single-line brace bug (start_line = end_line for function/class/method) exists
-        const symCheck = await query(`
+        // Refresh symbols if missing, if symbol_hash is missing, if EMBED_CODE_SYMBOLS=true and embedding is missing, or if single-line brace bug exists
+        const shouldEmbedSymbols = process.env.EMBED_CODE_SYMBOLS === 'true';
+        const symCheck = await query(
+            shouldEmbedSymbols
+                ? `
+            SELECT count(*)::int AS cnt,
+                   count(*) FILTER (WHERE symbol_hash IS NULL OR embedding IS NULL OR (symbol_type IN ('function', 'class', 'method') AND start_line = end_line))::int AS stale_cnt
+            FROM code_symbols
+            WHERE blob_id = $1 AND repository_id = $2 AND file_path = $3
+        `
+                : `
             SELECT count(*)::int AS cnt,
                    count(*) FILTER (WHERE symbol_hash IS NULL OR (symbol_type IN ('function', 'class', 'method') AND start_line = end_line))::int AS stale_cnt
             FROM code_symbols
             WHERE blob_id = $1 AND repository_id = $2 AND file_path = $3
-        `, [sha, repoId, relativePath]);
+        `,
+            [sha, repoId, relativePath]
+        );
         if (symCheck.rows[0].cnt === 0 || symCheck.rows[0].stale_cnt > 0) {
-            await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext);
+            await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, { progress });
         }
 
         if (existing.rows[0].embedding !== null) {
@@ -196,7 +250,7 @@ async function insertBlob(repoId, buffer, filePath, rootDir) {
             `INSERT INTO blobs (id, repository_id, size, embedding, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4::vector, $5, $6, $7, 'pointer') ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding, file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, last_seen_at = CURRENT_TIMESTAMP`,
             [sha, repoId, buffer.length, embeddingStr, fileName, relativePath, summary]
         );
-        syncProgress.embedded++;
+        progress.embedded++;
     } else {
         await query(
             `INSERT INTO blobs (id, repository_id, size, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4, $5, $6, 'pointer') ON CONFLICT (id) DO UPDATE SET file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, last_seen_at = CURRENT_TIMESTAMP`,
@@ -205,7 +259,7 @@ async function insertBlob(repoId, buffer, filePath, rootDir) {
     }
 
     // Populate code symbols & dependency edges
-    await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext);
+    await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, { progress });
 
     return sha;
 }
@@ -218,8 +272,13 @@ function hashTree(entries) {
     return crypto.createHash('sha1').update(`tree ${content.length}\0${content}`).digest('hex');
 }
 
-async function processDirectory(dirPath, repoId, rootDir) {
-    const items = await fs.readdir(dirPath, { withFileTypes: true });
+async function processDirectory(dirPath, repoId, rootDir, progress = createSyncProgress()) {
+    const resolvedDir = path.resolve(String(dirPath || ''));
+    const resolvedRoot = path.resolve(String(rootDir || ''));
+    if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(resolvedRoot + path.sep)) {
+        throw new Error(`Path traversal blocked in processDirectory: ${dirPath} is outside ${rootDir}`);
+    }
+    const items = await fs.readdir(resolvedDir, { withFileTypes: true });
     const entries = [];
 
     for (const item of items) {
@@ -255,7 +314,7 @@ async function processDirectory(dirPath, repoId, rootDir) {
             continue;
         }
         if (item.isDirectory()) {
-            const treeSha = await processDirectory(fullPath, repoId, rootDir);
+            const treeSha = await processDirectory(fullPath, repoId, rootDir, progress);
             if (treeSha) {
                 entries.push({ type: 'tree', name: item.name, object_id: treeSha });
             }
@@ -280,37 +339,37 @@ async function processDirectory(dirPath, repoId, rootDir) {
             // Skip files with heavy inline SVGs or minified structures that crash llama.cpp (GGML_ASSERT)
             const crashyFiles = new Set(['icons.tsx', 'open-in-chat.tsx', 'docs-copy-page.tsx', 'ai-sdk-agents-patterns.tsx', 'blocks-grid.tsx', 'home-below-hero-layouts.tsx', 'components.json', 'package-lock.json', 'ai-instructions-demo.json', 'ai-instructions.json', 'colors.ts', 'blocks.ts']);
             if (crashyFiles.has(item.name)) {
-                syncProgress.skipped++;
+                progress.skipped++;
                 console.log(`[Skip] Skipping SVG-heavy or crashy file: ${path.relative(rootDir, fullPath)}`);
                 continue;
             }
             
             // Skip large binary files entirely (they bloat the DB without providing search value)
             if (!embeddable && stat.size > MAX_BINARY_SIZE) {
-                syncProgress.skipped++;
+                progress.skipped++;
                 continue;
             }
             
             // Skip massive text files (minified bundles, huge generated code)
             if (embeddable && stat.size > MAX_EMBEDDABLE_SIZE) {
-                syncProgress.skipped++;
+                progress.skipped++;
                 console.log(`[Skip] Large text file: ${path.relative(rootDir, fullPath)} (${Math.round(stat.size/1024)}KB)`);
                 continue;
             }
             
             // General hard cap: no file over 50MB
             if (stat.size > 50 * 1024 * 1024) {
-                syncProgress.skipped++;
+                progress.skipped++;
                 continue;
             }
             
             const buffer = await fs.readFile(fullPath);
-            const blobSha = await insertBlob(repoId, buffer, fullPath, rootDir);
+            const blobSha = await insertBlob(repoId, buffer, fullPath, rootDir, progress);
             entries.push({ type: 'blob', name: item.name, object_id: blobSha });
             
-            syncProgress.processed++;
-            if (syncProgress.processed % 100 === 0) {
-                console.log(`[Progress] ${syncProgress.processed} files processed, ${syncProgress.embedded} embedded, ${syncProgress.skipped} skipped`);
+            progress.processed++;
+            if (progress.processed % 100 === 0) {
+                console.log(`[Progress] ${progress.processed} files processed, ${progress.embedded} embedded, ${progress.skipped} skipped`);
             }
         }
     }
@@ -371,7 +430,7 @@ Environment Variables:
     }
     const repoName = path.basename(targetDir);
     
-    syncProgress = { processed: 0, total: 0, embedded: 0, skipped: 0, symbols: 0, edges: 0 };
+    const progress = createSyncProgress();
     console.log(`Starting Semantic PG-Git Snapshot for: ${repoName}`);
     console.log(`Target Directory: ${targetDir}`);
     console.log(`LLM Summary Generation: ${process.env.SKIP_LLM_SUMMARY === 'true' ? 'DISABLED (avoid VRAM thrashing)' : 'ENABLED'}`);
@@ -388,7 +447,7 @@ Environment Variables:
     console.log(`[Repo Debug] Resolved repository ID for ${repoName}:`, repoId, `type: ${typeof repoId}`);
 
     // Process Tree
-    const rootTreeSha = await processDirectory(targetDir, repoId, targetDir);
+    const rootTreeSha = await processDirectory(targetDir, repoId, targetDir, progress);
     if (!rootTreeSha) {
         console.log('Directory is empty or all ignored.');
         await pool.end();
@@ -430,7 +489,7 @@ Environment Variables:
     }
 
     console.log(`✅ Snapshot complete! Commit SHA: ${commitSha}`);
-    console.log(`   Files: ${syncProgress.processed} processed, ${syncProgress.embedded} embedded, ${syncProgress.symbols} symbols, ${syncProgress.edges} edges, ${syncProgress.skipped} skipped`);
+    console.log(`   Files: ${progress.processed} processed, ${progress.embedded} embedded, ${progress.symbols} symbols, ${progress.edges} edges, ${progress.skipped} skipped`);
     
     // Log fleet health if available
     try {

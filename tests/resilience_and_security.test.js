@@ -238,6 +238,16 @@ test('REST API: Search, Symbols, and Graph endpoints respond correctly', async (
         // 10. Explicit unknown repo parameter returns 404 instead of searching all repos (GIT-07)
         const unknownRepoRes = await fetch(`${base}/api/search?q=hermetic&repo=non-existent-repo-xyz-999`);
         assert.strictEqual(unknownRepoRes.status, 404);
+
+        // 11. Unhandled database/internal errors delegate to centralized error handler and return generic 500 message (SEC-01)
+        const dupRepoRes = await fetch(`${base}/api/repos`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: testRepoName, description: 'Trigger duplicate 500' })
+        });
+        assert.strictEqual(dupRepoRes.status, 500);
+        const dupRepoData = await dupRepoRes.json();
+        assert.strictEqual(dupRepoData.error, 'Internal server error');
     } finally {
         await pool.query(`DELETE FROM repositories WHERE id = $1`, [repoId]);
         await new Promise((resolve) => srv.close(resolve));
@@ -336,9 +346,43 @@ test('INV-GIT-07 & INV-GIT-08: Embedding LRU cache and OllamaQueue deterministic
     assert.deepStrictEqual(order, ['first-in-flight', 'high-1', 'high-2', 'low-1', 'low-2']);
 });
 
+test('BUG-02 & SEC-02: createRepository sanitizes duplicate constraint violation without leaking internal schema details', async () => {
+    const { createRepository } = await import('../db/repository-service.js');
+    const uniqueName = `dup-repo-test-${Date.now()}`;
+    const created = await createRepository(uniqueName, 'Initial repo');
+    assert.ok(created && created.id);
+    try {
+        await assert.rejects(
+            async () => {
+                await createRepository(uniqueName, 'Duplicate repo');
+            },
+            (err) => {
+                assert.strictEqual(err.code, '23505');
+                assert.strictEqual(err.status, 400);
+                assert.strictEqual(err.message, 'Repository already exists');
+                assert.ok(!/duplicate key value|repositories_name_key/i.test(err.message));
+                return true;
+            }
+        );
+    } finally {
+        await pool.query(`DELETE FROM repositories WHERE id = $1`, [created.id]);
+    }
+});
+
+test('BUG-01: createSyncProgress returns isolated per-run progress counters', async () => {
+    const { createSyncProgress } = await import('../scripts/sync_to_pg.js');
+    const p1 = createSyncProgress();
+    const p2 = createSyncProgress();
+    p1.processed += 5;
+    p1.symbols += 12;
+    assert.strictEqual(p2.processed, 0);
+    assert.strictEqual(p2.symbols, 0);
+});
+
 after(async () => {
     await pool.end();
 });
+
 
 
 

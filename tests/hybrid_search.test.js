@@ -214,6 +214,29 @@ test('Database Schema & Search: hybrid RRF, keyword, and backward compatibility'
     }
 });
 
+test('SEC-01: searchBlobs validates queryOrVector, limit, repositoryId, and options keys', async () => {
+    await assert.rejects(
+        () => searchBlobs(null, 5, 1),
+        (err) => err instanceof TypeError && /queryOrVector must be a string or number\[\]/.test(err.message)
+    );
+    await assert.rejects(
+        () => searchBlobs('valid', 0, 1),
+        (err) => err instanceof TypeError && /limit must be a positive integer/.test(err.message)
+    );
+    await assert.rejects(
+        () => searchBlobs('valid', 5, { bad: true }),
+        (err) => err instanceof TypeError && /repositoryId must be a string or number/.test(err.message)
+    );
+    await assert.rejects(
+        () => searchBlobs('valid', 5, 1, 123),
+        (err) => err instanceof TypeError && /options must be an object or a recognized string/.test(err.message)
+    );
+    await assert.rejects(
+        () => searchBlobs('valid', 5, 1, { search_type: 'keyword', unexpectedKey: true }),
+        (err) => err instanceof TypeError && /Invalid option keys: unexpectedKey/.test(err.message)
+    );
+});
+
 after(async () => {
     await pool.end();
 });

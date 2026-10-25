@@ -384,7 +384,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             let embeddingAttempted = false;
             if (search_type !== "keyword") {
                 embeddingAttempted = true;
-                vector = await getEmbedding(searchQuery, PRIORITY.HIGH);
+                vector = await getEmbedding(searchQuery, PRIORITY.HIGH, { mode: 'query' });
             }
             
             const results = await searchBlobs(searchQuery, limit, resolvedRepoId, {

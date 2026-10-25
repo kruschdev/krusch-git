@@ -29,7 +29,7 @@ function envOr(envKey, fileValue, defaultValue) {
     return defaultValue;
 }
 
-function parseDatabaseUrl(urlStr) {
+export function parseDatabaseUrl(urlStr, { strict = false } = {}) {
     try {
         const u = new URL(urlStr);
         return {
@@ -39,7 +39,11 @@ function parseDatabaseUrl(urlStr) {
             user: u.username || undefined,
             password: u.password || undefined
         };
-    } catch (_) {
+    } catch (err) {
+        console.error('Invalid DATABASE_URL:', err.message);
+        if (strict) {
+            throw err;
+        }
         return {};
     }
 }
@@ -56,15 +60,25 @@ export const config = {
         host: dbUrlConfig.host || envOr('DB_HOST', baseConfig.db?.host, 'localhost'),
         port: dbUrlConfig.port ? parseInt(dbUrlConfig.port, 10) : envOr('DB_PORT', baseConfig.db?.port, 5432),
         database: dbUrlConfig.database || envOr('DB_NAME', baseConfig.db?.database, 'kdcode'),
-        user: dbUrlConfig.user || envOr('DB_USER', baseConfig.db?.user, 'kdcode'),
-        password: dbUrlConfig.password || envOr('DB_PASSWORD', baseConfig.db?.password, 'password'),
+        user: dbUrlConfig.user || envOr('DB_USER', baseConfig.db?.user, undefined),
+        password: dbUrlConfig.password || envOr('DB_PASSWORD', baseConfig.db?.password, undefined),
         poolSize: baseConfig.db?.poolSize || 10
     },
     ai: {
-        embedModel: envOr('EMBED_MODEL', baseConfig.ai?.embedModel, 'bge-large'),
+        embedModel: envOr('EMBED_MODEL', baseConfig.ai?.embedModel, 'snowflake-arctic-embed2'),
         ollamaUrl: envOr('OLLAMA_URL', baseConfig.ai?.ollamaUrl, 'http://localhost:11434')
     }
 };
+
+export function validateDbConfig(dbCfg = config.db) {
+    if (!dbCfg.user) {
+        throw new Error('Missing required DB_USER (or user in DATABASE_URL)');
+    }
+    if (!dbCfg.password) {
+        throw new Error('Missing required DB_PASSWORD (or password in DATABASE_URL)');
+    }
+    return true;
+}
 
 export function updateConfig(newValues) {
     if (newValues.ai) {

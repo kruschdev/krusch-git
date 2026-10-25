@@ -26,7 +26,6 @@ const PROJECTS = [
     'hivemind-companion-ext',
     'home-ai',
     'jean-sre',
-    'krusch-dbos-mcp',
     'krusch-agentic-mcp',
     'krusch-biz',
     'krusch-bizlaw',
@@ -147,7 +146,10 @@ Environment Variables:
                 discoveredProjects.push(entry.name);
             }
         }
-    } catch (_) {}
+    } catch (err) {
+        console.error('[sync_all_projects] Failed to read HOMELAB_ROOT:', err);
+        throw err;
+    }
 
     let allTasks;
     if (singleProject) {

@@ -1,38 +1,23 @@
-import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../db/pool.js';
 import { getEmbedding, PRIORITY } from '../lib/embedding.js';
 import { computeSymbolHash } from '../lib/ast-chunker.js';
+import { hashContent as _hashContent } from '../lib/hash.js';
+import { createRepository as _createRepository, getRepositories, getRepository } from '../db/repository-service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECTS_ROOT = path.resolve(__dirname, '..', '..');
-
-
 export function hashContent(buffer) {
-    // Basic SHA-1 similar to git blob hashing
-    const header = `blob ${buffer.length}\0`;
-    return crypto.createHash('sha1').update(header).update(buffer).digest('hex');
+    // Delegates crypto.createHash('sha1') to ../lib/hash.js
+    return _hashContent(buffer);
 }
 
-export async function createRepository(name, description = '') {
-    const res = await query(
-        `INSERT INTO repositories (name, description) VALUES ($1, $2) RETURNING *`,
-        [name, description]
-    );
-    return res.rows[0];
+export async function createRepository(name, description) {
+    return _createRepository(name, description);
 }
-
-export async function getRepositories() {
-    const res = await query(`SELECT * FROM repositories ORDER BY created_at DESC`);
-    return res.rows;
-}
-
-export async function getRepository(id) {
-    const res = await query(`SELECT * FROM repositories WHERE id = $1`, [id]);
-    return res.rows[0];
-}
+export { getRepositories, getRepository };
 
 // Minimal placeholder for inserting a blob
 export async function insertBlob(repoId, buffer) {
@@ -58,14 +43,22 @@ export async function getTreeEntries(treeId, repositoryId = null) {
     return res.rows;
 }
 
-export async function getBlob(blobId) {
-    const res = await query(`
-        SELECT b.*, r.name AS project 
-        FROM blobs b
-        JOIN repositories r ON b.repository_id = r.id
-        WHERE b.id = $1
-    `, [blobId]);
-    return res.rows[0];
+export async function getBlob(blobId, queryFn = query) {
+    try {
+        const res = await queryFn(`
+            SELECT b.*, r.name AS project 
+            FROM blobs b
+            JOIN repositories r ON b.repository_id = r.id
+            WHERE b.id = $1
+        `, [blobId]);
+        if (!res || !Array.isArray(res.rows) || !res.rows.length) {
+            return null;
+        }
+        return res.rows[0];
+    } catch (err) {
+        console.error('[krusch-git] getBlob query failed:', err?.message || 'unknown error');
+        throw new Error('Database query failed');
+    }
 }
 
 export async function resolveBlobContent(blob) {
@@ -175,10 +168,32 @@ export async function getRepoRootTree(repoId) {
  * 
  * Backward compatible with existing callers in krusch-context-mcp and REST API.
  */
-export async function searchBlobs(queryOrVector, limit = 5, repositoryId, options = {}) {
+export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null, options = {}) {
+    if (typeof queryOrVector !== 'string' && !Array.isArray(queryOrVector)) {
+        throw new TypeError('queryOrVector must be a string or number[]');
+    }
+    if (!Number.isInteger(limit) || limit <= 0) {
+        throw new TypeError('limit must be a positive integer');
+    }
+    if (
+        repositoryId !== undefined &&
+        repositoryId !== null &&
+        typeof repositoryId !== 'string' &&
+        typeof repositoryId !== 'number'
+    ) {
+        throw new TypeError('repositoryId must be a string or number');
+    }
+    if (options !== undefined && options !== null && typeof options !== 'string' && (typeof options !== 'object' || Array.isArray(options))) {
+        throw new TypeError('options must be an object or a recognized string');
+    }
     const normalizedOptions = typeof options === 'string'
         ? { search_type: options }
         : (options || {});
+    const allowedOptionKeys = ['search_type', 'query', 'vector', 'embeddingAttempted'];
+    const invalidKeys = Object.keys(normalizedOptions).filter(k => !allowedOptionKeys.includes(k));
+    if (invalidKeys.length) {
+        throw new TypeError(`Invalid option keys: ${invalidKeys.join(', ')}`);
+    }
 
     let vector = null;
     let textQuery = null;
@@ -199,7 +214,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId, option
     // Attempt to obtain vector at HIGH priority if doing hybrid or semantic search and vector was not already attempted
     if (!vector && !hasExplicitVectorOption && textQuery && searchType !== 'keyword') {
         try {
-            vector = await getEmbedding(textQuery, PRIORITY.HIGH);
+            vector = await getEmbedding(textQuery, PRIORITY.HIGH, { mode: 'query' });
         } catch (e) {
             console.warn(`[searchBlobs] Embedding retrieval failed, falling back to keyword BM25: ${e.message}`);
         }
@@ -474,6 +489,58 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
             seen.add(key);
             uniqueRows.push(row);
             if (uniqueRows.length >= safeLimit) break;
+        }
+    }
+
+    // Supplement with HNSW dense AST symbol search (idx_code_symbols_embedding) when lexical matches are empty or sparse
+    if (options.semantic !== false && uniqueRows.length < safeLimit && (uniqueRows.length === 0 || rawQuery.includes(' '))) {
+        try {
+            const qVec = await getEmbedding(rawQuery, PRIORITY.HIGH, { mode: 'query' });
+            if (Array.isArray(qVec) && qVec.length > 0) {
+                const vecLiteral = `[${qVec.join(',')}]`;
+                const semParams = [vecLiteral];
+                let semSql = `
+                    SELECT
+                        sym.id,
+                        sym.blob_id,
+                        sym.repository_id,
+                        r.name AS project,
+                        sym.file_path,
+                        sym.symbol_name,
+                        sym.symbol_type,
+                        sym.start_line,
+                        sym.end_line,
+                        sym.signature,
+                        sym.content,
+                        sym.symbol_hash,
+                        (1 - (sym.embedding <=> $1::vector)) AS similarity
+                    FROM code_symbols sym
+                    JOIN repositories r ON r.id = sym.repository_id
+                    WHERE sym.embedding IS NOT NULL
+                `;
+                if (repositoryId) {
+                    semParams.push(repositoryId);
+                    semSql += ` AND sym.repository_id = $${semParams.length}`;
+                }
+                if (symbolType) {
+                    semParams.push(symbolType);
+                    semSql += ` AND sym.symbol_type = $${semParams.length}`;
+                }
+                semParams.push((safeLimit - uniqueRows.length) * 2);
+                semSql += ` ORDER BY sym.embedding <=> $1::vector ASC LIMIT $${semParams.length}`;
+                const semRes = await query(semSql, semParams);
+                for (const row of semRes.rows) {
+                    if (Number(row.similarity) < 0.35) continue;
+                    const key = `${row.repository_id}:${row.file_path}:${row.symbol_name}:${row.symbol_type}:${row.start_line}`;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        uniqueRows.push(row);
+                        if (uniqueRows.length >= safeLimit) break;
+                    }
+                }
+            }
+        } catch (err) {
+            console.warn(`[searchSymbols] Semantic symbol fallback skipped: ${err.message}`);
         }
     }
 

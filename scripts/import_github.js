@@ -74,7 +74,11 @@ export async function populateSymbolsAndEdges(blobHash, repoId, name, parsedSymb
 
         await client.query('COMMIT');
     } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (_) {}
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+            console.error(`[Import] Rollback failed for ${name}: ${rollbackErr.message}`);
+        }
         throw err;
     } finally {
         client.release();
@@ -114,7 +118,9 @@ async function processBlob(blobHash, name, repoId, targetDir) {
                 const extracted = extractSymbolsAndImports(text, name);
                 parsedSymbols = extracted.symbols || [];
                 parsedImports = extracted.imports || [];
-            } catch (_) {}
+            } catch (err) {
+                console.warn(`[AST] Symbol extraction skipped for ${name} (${blobHash.substring(0, 7)}): ${err.message}`);
+            }
         }
 
         const fileName = path.basename(name);

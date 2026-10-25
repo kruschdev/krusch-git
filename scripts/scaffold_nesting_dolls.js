@@ -19,7 +19,7 @@ const PG_GIT_SYNC = 'node $(git rev-parse --show-toplevel)/projects/pg-git/scrip
 // Active projects from sync_all_projects.js + sentinel
 const ACTIVE_PROJECTS = [
   'annotated', 'berean', 'caren', 'first-things-first', 'heyjb',
-  'hivemind-companion-ext', 'home-ai', 'krusch-dbos-mcp', 'krusch-agentic-mcp',
+  'hivemind-companion-ext', 'home-ai', 'krusch-agentic-mcp',
   'krusch-infra-mcp', 'krusch', 'lightmind', 'money-machine',
   'perkins_snow_removal', 'pocket-lawyer', 'pocket-lawyer-marketing',
   'roughin-suite', 'signet', 'spark', 'krusch-sentinel-mcp'

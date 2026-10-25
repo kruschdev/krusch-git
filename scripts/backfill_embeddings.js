@@ -18,9 +18,9 @@ import { pool } from '../db/pool.js';
 const HOMELAB_REPOS = new Set([
     'annotated', 'agent-toolkit-for-aws', 'berean', 'caren', 'first-things-first',
     'g-krusch', 'heyjb', 'hivemind-companion-ext', 'home-ai', 'jean-sre',
-    'krusch-dbos-mcp', 'krusch-agentic-mcp', 'krusch-context-mcp', 'krusch-fs',
+    'krusch-agentic-mcp', 'krusch-context-mcp', 'krusch-fs',
     'krusch-gateway-mcp', 'krusch-git', 'krusch-harness', 'krusch-infra-mcp',
-    'krusch', 'krusch-frontend-mcp', 'krusch-nexus', 'krusch-oss', 'krusch-pg-agent',
+    'krusch', 'krusch-frontend-mcp', 'krusch-nexus', 'krusch-oss',
     'krusch-pocketlawyer-mcp', 'krusch-sentinel-mcp', 'krusch-sequential-mcp',
     'krusch-cascade-router', 'krusch-router', 'lightmind', 'money-machine',
     'perkins_snow_removal', 'pg-git', 'pocket-lawyer', 'pocket-lawyer-marketing',
