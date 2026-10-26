@@ -51,8 +51,8 @@ jobs:
 
       - name: Instant Failure Push Notification
         if: failure()
-      env:
-        NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
+        env:
+          NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
         run: |
           curl -s -X POST \
             -H "Title: 🚨 CI Failure: ${{ github.repository }} (Node 22 + pgvector)" \
