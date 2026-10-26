@@ -50,9 +50,9 @@ Krusch-Git and [krusch-context-mcp](https://github.com/kruschdev/krusch-context-
 
 ## ⚡ Quick Start
 
-You **must** have [Ollama](https://ollama.com/) running with the `bge-large` embedding model pulled:
+You **must** have [Ollama](https://ollama.com/) running with a `1024`-dimensional embedding model pulled (default: `snowflake-arctic-embed2`, `8,192`-token context; also supports `qwen3-embedding` MRL `1024d` or `bge-large`):
 ```bash
-ollama pull bge-large
+ollama pull snowflake-arctic-embed2
 ```
 
 **1. Clone & Migrate Database**
@@ -69,9 +69,9 @@ node db/migrate.js
 **2. Import Your GitHub History**
 
 > [!WARNING]
-> **Choose your embedding model carefully.** You must set your preferred model (via the Web UI Settings tab or `.env`) *before* running your first import or snapshot. If you change models later, vector dimensions will collide and you will be forced to manually wipe the database and re-embed all repositories from scratch.
+> **Choose your embedding model carefully.** Set your preferred `1024`-dim model (via the Web UI Settings tab or `EMBED_MODEL` in `.env`) *before* running your first import or snapshot. Mixing incompatible vector spaces without re-embedding will degrade semantic search recall.
 
-You can instantly import any local `.git` repository. Krusch-Git will natively parse the Git history, generate semantic embeddings for all blobs, and securely deduplicate them into PostgreSQL:
+You can instantly import any local `.git` repository. Krusch-Git will natively parse the Git history, generate semantic embeddings for all blobs and AST symbols, and securely deduplicate them into PostgreSQL:
 ```bash
 npm run import
 ```
@@ -88,7 +88,7 @@ Add Krusch-Git to your agent/IDE configuration (e.g., `mcp_config.json`):
       "env": {
         "DATABASE_URL": "postgresql://kdcode:password@localhost:5432/kdcode",
         "OLLAMA_URL": "http://localhost:11434",
-        "EMBED_MODEL": "bge-large"
+        "EMBED_MODEL": "snowflake-arctic-embed2"
       }
     }
   }
@@ -239,9 +239,9 @@ Krusch-Git uses a layered configuration system: environment variables override `
 | `DB_USER` | Database User | `kdcode` |
 | `DB_PASSWORD` | Database Password | `password` |
 | `OLLAMA_URL` | The endpoint for your local Ollama instance | `http://localhost:11434` |
-| `EMBED_MODEL`| The Ollama text-embedding model to use | `bge-large` |
+| `EMBED_MODEL`| The Ollama text-embedding model to use | `snowflake-arctic-embed2` |
 
-### Database Schema (v1.1.0)
+### Database Schema (v1.2.2)
 
 Krusch-Git's PostgreSQL schema maps Git objects and code structure directly into SQL tables:
 
@@ -250,7 +250,7 @@ Krusch-Git's PostgreSQL schema maps Git objects and code structure directly into
 - **`branches`** — Named references to commit heads
 - **`trees`** / **`tree_entries`** — Directory structures mapping names to blob/tree object IDs
 - **`blobs`** — File content with `embedding vector(1024)`, `tsv tsvector` (simple full-text BM25 index), and `last_seen_at` temporal tracking
-- **`code_symbols`** — Structural AST-extracted functions, classes, methods, and routes with signatures and exact `start_line`/`end_line` ranges
+- **`code_symbols`** — Structural AST-extracted functions, classes, methods, and routes with signatures, `embedding vector(1024)` HNSW index, and exact `start_line`/`end_line` ranges
 - **`code_symbol_edges`** — Relational dependency graph tracking outbound `imports` and inbound callers/dependents across files
 
 ### MCP Tools Reference (v1.2.0)
