@@ -22,6 +22,7 @@ import {
 } from './git-engine.js';
 
 import { getEmbedding, PRIORITY } from '../lib/embedding.js';
+import { findUnattestedIdentifiers } from '../lib/graph-bridge.js';
 import { pool } from '../db/pool.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -402,8 +403,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const dateStr = r.last_seen_at ? new Date(r.last_seen_at).toISOString().split('T')[0] : 'unknown';
                 const projectTag = r.project ? `[${r.project}]` : '';
                 const pathStr = r.file_path ? ` | Path: ${r.file_path}` : '';
-                output += `\n--- Match (Score: ${Number(r.similarity).toFixed(3)}) | ${projectTag} ${r.file_name}${pathStr} | Seen: ${dateStr} ---\n`;
+                const bridgeTag = r._isBridgeHop ? ` [Graph Bridge via ${r._bridgeVia}]` : '';
+                output += `\n--- Match (Score: ${Number(r.similarity).toFixed(3)})${bridgeTag} | ${projectTag} ${r.file_name}${pathStr} | Seen: ${dateStr} ---\n`;
                 output += (r.summary || '(no preview)') + '\n';
+            }
+            const unattested = findUnattestedIdentifiers(searchQuery, results);
+            if (unattested.length > 0) {
+                output += `\nNote — Unattested query identifiers not found in top matches: ${unattested.join(', ')}\n`;
             }
             return { content: [{ type: "text", text: output }] };
 
@@ -596,7 +602,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 async function shutdown() {
     console.error('[krusch-git] Shutting down...');
-    try { await pool.end(); } catch (_) { /* best-effort */ }
+    try { await pool.end(); } catch (endErr) { /* best-effort */ }
     process.exit(0);
 }
 

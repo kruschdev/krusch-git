@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS blobs (
     file_name VARCHAR(255),
     file_path TEXT,
     summary TEXT,
+    symbol_spine TEXT,
+    embed_model VARCHAR(128),
     storage_mode VARCHAR(10) DEFAULT 'full',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -61,13 +63,22 @@ CREATE INDEX IF NOT EXISTS idx_tree_entries_tree ON tree_entries(tree_id);
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ALTER TABLE blobs ADD COLUMN IF NOT EXISTS embedding vector(1024);
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS embed_model VARCHAR(128);
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS symbol_spine TEXT;
 ALTER TABLE blobs ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
-ALTER TABLE blobs ADD COLUMN IF NOT EXISTS tsv tsvector 
-    GENERATED ALWAYS AS (to_tsvector('simple', coalesce(file_name, '') || ' ' || coalesce(file_path, '') || ' ' || coalesce(summary, ''))) STORED;
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS tsv tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('simple', coalesce(file_name, '') || ' ' || coalesce(file_path, '')), 'A') ||
+        setweight(to_tsvector('english', translate(regexp_replace(coalesce(file_name, '') || ' ' || coalesce(file_path, '') || ' ' || coalesce(symbol_spine, ''), '([a-z0-9])([A-Z])', '\1 \2', 'g'), '_/.-', '    ')), 'A') ||
+        setweight(to_tsvector('simple', coalesce(symbol_spine, '')), 'B') ||
+        setweight(to_tsvector('english', coalesce(summary, '')), 'C')
+    ) STORED;
 
 CREATE INDEX IF NOT EXISTS blobs_embedding_idx ON blobs USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS blobs_tsv_idx ON blobs USING gin(tsv);
 CREATE INDEX IF NOT EXISTS idx_blobs_repo_path ON blobs(repository_id, file_path);
+CREATE INDEX IF NOT EXISTS idx_blobs_repo_path_seen ON blobs (repository_id, file_path, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_blobs_embed_model ON blobs (embed_model);
 CREATE INDEX IF NOT EXISTS idx_blobs_repo_name ON blobs(repository_id, file_name);
 CREATE INDEX IF NOT EXISTS idx_blobs_path_trgm ON blobs USING gin (file_path gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_blobs_name_trgm ON blobs USING gin (file_name gin_trgm_ops);
@@ -86,9 +97,11 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     content TEXT,
     symbol_hash VARCHAR(64),
     embedding vector(1024),
+    embed_model VARCHAR(128),
     tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(symbol_name, '') || ' ' || coalesce(signature, '') || ' ' || coalesce(content, ''))) STORED,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE code_symbols ADD COLUMN IF NOT EXISTS embed_model VARCHAR(128);
 
 CREATE INDEX IF NOT EXISTS idx_code_symbols_blob ON code_symbols(blob_id);
 CREATE INDEX IF NOT EXISTS idx_code_symbols_repo_name ON code_symbols(repository_id, symbol_name);

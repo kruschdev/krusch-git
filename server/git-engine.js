@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../db/pool.js';
-import { getEmbedding, PRIORITY } from '../lib/embedding.js';
+import { getEmbedding, getActiveEmbedModel, calibrateQuerySimilarity, PRIORITY } from '../lib/embedding.js';
 import { computeSymbolHash } from '../lib/ast-chunker.js';
 import { hashContent as _hashContent } from '../lib/hash.js';
 import { createRepository as _createRepository, getRepositories, getRepository } from '../db/repository-service.js';
@@ -18,7 +18,7 @@ export async function createRepository(name, description) {
     return _createRepository(name, description);
 }
 export { getRepositories, getRepository };
-
+import { buildExpandedEnglishQuery, expandCodeGraphBridges } from '../lib/graph-bridge.js';
 // Minimal placeholder for inserting a blob
 export async function insertBlob(repoId, buffer) {
     const sha = hashContent(buffer);
@@ -116,7 +116,7 @@ export async function resolveBlobContent(blob) {
                     stat = await fs.stat(altPath);
                     targetPath = altPath;
                     baseDir = altProjectDir;
-                } catch (_) {
+                } catch (altErr) {
                     // Neither exists
                 }
             }
@@ -153,17 +153,31 @@ export async function getRepoRootTree(repoId) {
     return res.rows[0]?.tree_id || null;
 }
 
+async function queryWithLegacySchemaFallback(modernSql, modernParams, buildLegacy) {
+    try {
+        return await query(modernSql, modernParams);
+    } catch (err) {
+        if (err && err.code === '42703' && typeof buildLegacy === 'function') {
+            const { sql: legacySql, params: legacyParams } = buildLegacy();
+            return await query(legacySql, legacyParams);
+        }
+        throw err;
+    }
+}
+
 /**
  * Hybrid search (BM25 + Dense Semantic Vector via Reciprocal Rank Fusion / RRF)
- * with exponential temporal decay:
- * Final Score = RRF * exp(-0.01 * age_in_days)
+ * with exponential temporal decay, latest-blob deduplication per (repository_id, file_path),
+ * embed_model space isolation, isotropic cosine calibration, and gated 2-hop graph bridging.
  * 
  * Supports:
  * 1. queryOrVector: number[] (legacy vector) or string (text query).
  * 2. options: string ('hybrid' | 'semantic' | 'keyword') OR {
  *      search_type?: 'hybrid' | 'semantic' | 'keyword',
  *      query?: string,
- *      vector?: number[]
+ *      vector?: number[],
+ *      embeddingAttempted?: boolean,
+ *      include_bridges?: boolean
  *    }
  * 
  * Backward compatible with existing callers in krusch-context-mcp and REST API.
@@ -189,7 +203,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null,
     const normalizedOptions = typeof options === 'string'
         ? { search_type: options }
         : (options || {});
-    const allowedOptionKeys = ['search_type', 'query', 'vector', 'embeddingAttempted'];
+    const allowedOptionKeys = ['search_type', 'query', 'vector', 'embeddingAttempted', 'include_bridges'];
     const invalidKeys = Object.keys(normalizedOptions).filter(k => !allowedOptionKeys.includes(k));
     if (invalidKeys.length) {
         throw new TypeError(`Invalid option keys: ${invalidKeys.join(', ')}`);
@@ -197,7 +211,8 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null,
 
     let vector = null;
     let textQuery = null;
-    let searchType = normalizedOptions.search_type || 'hybrid';
+    const requestedSearchType = normalizedOptions.search_type || 'hybrid';
+    let searchType = requestedSearchType;
     const hasExplicitVectorOption = Object.prototype.hasOwnProperty.call(normalizedOptions, 'vector') || normalizedOptions.embeddingAttempted === true;
 
     if (Array.isArray(queryOrVector)) {
@@ -226,31 +241,109 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null,
     }
 
     const safeLimit = Math.max(1, Math.min(Number(limit) || 5, 100));
+    const scopedRepoId = (repositoryId !== undefined && repositoryId !== null && String(repositoryId).trim() !== '')
+        ? (Number.isNaN(Number(repositoryId)) ? repositoryId : Number(repositoryId))
+        : null;
+    const activeModel = getActiveEmbedModel();
+    const expandedQuery = textQuery ? buildExpandedEnglishQuery(textQuery) : '';
+    const shouldBridge = (
+        (requestedSearchType === 'hybrid' || normalizedOptions.include_bridges === true) &&
+        normalizedOptions.include_bridges !== false &&
+        Boolean(textQuery)
+    );
 
-    // 1. HYBRID SEARCH (RRF)
+    const repoFilterParam2 = scopedRepoId !== null ? 'AND b.repository_id = $2' : 'AND ($2::integer IS NULL)';
+    const repoFilterParam4 = scopedRepoId !== null ? 'AND b.repository_id = $4' : 'AND ($4::integer IS NULL)';
+
+    // 1. HYBRID SEARCH (RRF — HNSW + single-tsquery GIN + B-Tree NOT EXISTS latest-blob deduplication)
     if (searchType === 'hybrid' && vector && textQuery) {
         const vectorStr = `[${vector.join(',')}]`;
         const sql = `
-            WITH dense_matches AS (
-                SELECT 
+            WITH tsq AS MATERIALIZED (
+                SELECT (
+                    plainto_tsquery('simple', $4)
+                    || plainto_tsquery('english', $4)
+                    || CASE WHEN $5 <> '' THEN websearch_to_tsquery('english', $5) ELSE ''::tsquery END
+                ) AS q
+            ),
+            dense_raw AS MATERIALIZED (
+                SELECT
                     b.id,
-                    (1 - (b.embedding <=> $1::vector)) AS dense_sim,
-                    ROW_NUMBER() OVER (ORDER BY (b.embedding <=> $1::vector) ASC) AS dense_rank
+                    b.repository_id,
+                    b.file_path,
+                    b.last_seen_at,
+                    b.created_at,
+                    (1 - (b.embedding <=> $1::vector)) AS dense_sim
                 FROM blobs b
                 WHERE b.embedding IS NOT NULL
-                  AND ($2::integer IS NULL OR b.repository_id = $2)
+                  AND (b.embed_model IS NULL OR b.embed_model = $6)
+                  ${repoFilterParam2}
                 ORDER BY b.embedding <=> $1::vector ASC
-                LIMIT $3 * 4
+                LIMIT GREATEST(150, $3 * 20)
+            ),
+            dense_matches AS (
+                SELECT
+                    d.id,
+                    d.dense_sim,
+                    ROW_NUMBER() OVER (ORDER BY d.dense_sim DESC) AS dense_rank
+                FROM dense_raw d
+                WHERE d.file_path IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM blobs b2
+                    WHERE b2.repository_id = d.repository_id
+                      AND b2.file_path = d.file_path
+                      AND (
+                          COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) > COALESCE(d.last_seen_at, d.created_at, '-infinity'::timestamptz)
+                          OR (
+                              COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) = COALESCE(d.last_seen_at, d.created_at, '-infinity'::timestamptz)
+                              AND b2.id > d.id
+                          )
+                      )
+                )
+                ORDER BY d.dense_sim DESC
+                LIMIT GREATEST(60, $3 * 10)
+            ),
+            lexical_raw AS MATERIALIZED (
+                SELECT
+                    b.id,
+                    b.repository_id,
+                    b.file_path,
+                    b.last_seen_at,
+                    b.created_at,
+                    (
+                        COALESCE(ts_rank_cd(b.tsv, plainto_tsquery('simple', $4)), 0.0) * 1.5 +
+                        COALESCE(ts_rank_cd(b.tsv, plainto_tsquery('english', $4)), 0.0) * 1.25 +
+                        CASE
+                            WHEN $5 <> '' THEN COALESCE(ts_rank_cd(b.tsv, websearch_to_tsquery('english', $5)), 0.0)
+                            ELSE 0.0
+                        END
+                    ) AS bm25_score
+                FROM blobs b, tsq
+                WHERE tsq.q <> ''::tsquery
+                  AND b.tsv @@ tsq.q
+                  ${repoFilterParam2}
+                ORDER BY bm25_score DESC
+                LIMIT GREATEST(150, $3 * 20)
             ),
             lexical_matches AS (
-                SELECT 
-                    b.id,
-                    ts_rank_cd(b.tsv, plainto_tsquery('simple', $4)) AS bm25_score,
-                    ROW_NUMBER() OVER (ORDER BY ts_rank_cd(b.tsv, plainto_tsquery('simple', $4)) DESC) AS bm25_rank
-                FROM blobs b
-                WHERE b.tsv @@ plainto_tsquery('simple', $4)
-                  AND ($2::integer IS NULL OR b.repository_id = $2)
-                LIMIT $3 * 4
+                SELECT
+                    l.id,
+                    l.bm25_score,
+                    ROW_NUMBER() OVER (ORDER BY l.bm25_score DESC) AS bm25_rank
+                FROM lexical_raw l
+                WHERE l.file_path IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM blobs b2
+                    WHERE b2.repository_id = l.repository_id
+                      AND b2.file_path = l.file_path
+                      AND (
+                          COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) > COALESCE(l.last_seen_at, l.created_at, '-infinity'::timestamptz)
+                          OR (
+                              COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) = COALESCE(l.last_seen_at, l.created_at, '-infinity'::timestamptz)
+                              AND b2.id > l.id
+                          )
+                      )
+                )
+                ORDER BY l.bm25_score DESC
+                LIMIT GREATEST(60, $3 * 10)
             ),
             fused AS (
                 SELECT 
@@ -269,6 +362,7 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null,
                 b.repository_id,
                 r.name AS project,
                 COALESCE(b.summary, substring(encode(b.content, 'escape') from 1 for 500)) AS summary,
+                b.symbol_spine,
                 b.storage_mode,
                 b.last_seen_at,
                 COALESCE(b.file_name, b.id) AS file_name,
@@ -282,23 +376,42 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null,
             ORDER BY similarity DESC
             LIMIT $3;
         `;
-        const res = await query(sql, [vectorStr, repositoryId || null, safeLimit, textQuery]);
+        const params = [vectorStr, scopedRepoId, safeLimit, textQuery, expandedQuery, activeModel];
+        const res = await queryWithLegacySchemaFallback(sql, params, () => ({
+            sql: sql
+                .replace(/\s*AND \(b\.embed_model IS NULL OR b\.embed_model = \$6\)/g, '')
+                .replace(/b\.symbol_spine,/g, 'NULL::text AS symbol_spine,'),
+            params: [vectorStr, scopedRepoId, safeLimit, textQuery, expandedQuery]
+        }));
         if (res.rows.length > 0) {
-            return res.rows;
+            const calibratedRows = res.rows.map((row) => ({
+                ...row,
+                dense_sim: Number(row.dense_sim) > 0
+                    ? calibrateQuerySimilarity(Number(row.dense_sim), { model: activeModel, queryVec: vector })
+                    : 0
+            }));
+            if (shouldBridge) {
+                return await expandCodeGraphBridges(calibratedRows, textQuery, {
+                    queryFn: query,
+                    repositoryId: scopedRepoId,
+                    limit: safeLimit
+                });
+            }
+            return calibratedRows;
         }
         // If hybrid yielded 0 rows, fall through to dense search
     }
 
-    // 2. DENSE SEMANTIC SEARCH (Pure vector — inner ANN top-K subquery uses HNSW index blobs_embedding_idx)
+    // 2. DENSE SEMANTIC SEARCH (Pure vector — HNSW + B-Tree NOT EXISTS latest-blob deduplication)
     if (vector) {
         const vectorStr = `[${vector.join(',')}]`;
         const sql = `
-            WITH ann_candidates AS (
+            WITH ann_raw AS MATERIALIZED (
                 SELECT 
                     b.id,
                     b.repository_id,
                     b.summary,
-                    b.content,
+                    b.symbol_spine,
                     b.storage_mode,
                     b.last_seen_at,
                     b.created_at,
@@ -307,64 +420,174 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null,
                     (b.embedding <=> $1::vector) AS cosine_dist
                 FROM blobs b
                 WHERE b.embedding IS NOT NULL
-                  AND ($2::integer IS NULL OR b.repository_id = $2)
+                  AND (b.embed_model IS NULL OR b.embed_model = $4)
+                  ${repoFilterParam2}
                 ORDER BY b.embedding <=> $1::vector ASC
-                LIMIT $3 * 4
+                LIMIT GREATEST(150, $3 * 20)
+            ),
+            ann_candidates AS (
+                SELECT *
+                FROM ann_raw a
+                WHERE a.file_path IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM blobs b2
+                    WHERE b2.repository_id = a.repository_id
+                      AND b2.file_path = a.file_path
+                      AND (
+                          COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) > COALESCE(a.last_seen_at, a.created_at, '-infinity'::timestamptz)
+                          OR (
+                              COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) = COALESCE(a.last_seen_at, a.created_at, '-infinity'::timestamptz)
+                              AND b2.id > a.id
+                          )
+                      )
+                )
+                ORDER BY a.cosine_dist ASC
+                LIMIT GREATEST(60, $3 * 10)
             )
             SELECT 
                 c.id,
                 c.repository_id,
                 r.name AS project,
-                COALESCE(c.summary, substring(encode(c.content, 'escape') from 1 for 500)) AS summary,
+                COALESCE(c.summary, substring(encode(full_b.content, 'escape') from 1 for 500)) AS summary,
+                c.symbol_spine,
                 c.storage_mode,
                 c.last_seen_at,
                 COALESCE(c.file_name, c.id) AS file_name,
                 c.file_path,
+                (1 - c.cosine_dist) AS raw_dense_sim,
+                exp(-0.01 * EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(c.last_seen_at, c.created_at))) / 86400.0) AS decay_factor,
                 (1 - c.cosine_dist) 
                     * exp(-0.01 * EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(c.last_seen_at, c.created_at))) / 86400.0)
                 AS similarity
             FROM ann_candidates c
+            JOIN blobs full_b ON full_b.id = c.id
             JOIN repositories r ON r.id = c.repository_id
             ORDER BY similarity DESC
             LIMIT $3;
         `;
-        const res = await query(sql, [vectorStr, repositoryId ?? null, safeLimit]);
+        const params = [vectorStr, scopedRepoId, safeLimit, activeModel];
+        const res = await queryWithLegacySchemaFallback(sql, params, () => ({
+            sql: sql
+                .replace(/\s*AND \(b\.embed_model IS NULL OR b\.embed_model = \$4\)/g, '')
+                .replace(/b\.symbol_spine,/g, 'NULL::text AS symbol_spine,')
+                .replace(/c\.symbol_spine,/g, 'NULL::text AS symbol_spine,'),
+            params: [vectorStr, scopedRepoId, safeLimit]
+        }));
         if (res.rows.length > 0 || !textQuery) {
-            return res.rows;
+            const calibratedRows = res.rows.map((row) => {
+                const rawDense = row.raw_dense_sim !== undefined
+                    ? Number(row.raw_dense_sim)
+                    : Number(row.similarity || 0);
+                const decay = row.decay_factor !== undefined ? Number(row.decay_factor) : 1.0;
+                const calibratedDense = calibrateQuerySimilarity(rawDense, {
+                    model: activeModel,
+                    queryVec: vector
+                });
+                const rest = { ...row };
+                delete rest.raw_dense_sim;
+                delete rest.decay_factor;
+                return {
+                    ...rest,
+                    dense_sim: calibratedDense,
+                    similarity: calibratedDense * decay
+                };
+            });
+            if (shouldBridge && calibratedRows.length > 0) {
+                return await expandCodeGraphBridges(calibratedRows, textQuery, {
+                    queryFn: query,
+                    repositoryId: scopedRepoId,
+                    limit: safeLimit
+                });
+            }
+            return calibratedRows;
         }
     }
 
-    // 3. LEXICAL BM25 SEARCH (Fallback or pure keyword)
+    // 3. LEXICAL BM25 SEARCH (Fallback or pure keyword — single combined tsquery + B-Tree NOT EXISTS latest-blob deduplication)
     if (textQuery) {
         const escapedLike = textQuery.replace(/[_%]/g, '\\$&');
-        let sql = `
-            SELECT 
-                b.id,
-                b.repository_id,
+        const sql = `
+            WITH tsq AS MATERIALIZED (
+                SELECT (
+                    plainto_tsquery('simple', $1)
+                    || plainto_tsquery('english', $1)
+                    || CASE WHEN $3 <> '' THEN websearch_to_tsquery('english', $3) ELSE ''::tsquery END
+                ) AS q
+            ),
+            lexical_raw AS MATERIALIZED (
+                SELECT
+                    b.id,
+                    b.repository_id,
+                    b.summary,
+                    b.symbol_spine,
+                    b.storage_mode,
+                    b.last_seen_at,
+                    b.created_at,
+                    b.file_name,
+                    b.file_path,
+                    (
+                        GREATEST(
+                            COALESCE(ts_rank_cd(b.tsv, plainto_tsquery('simple', $1)), 0.0) * 1.5 +
+                            COALESCE(ts_rank_cd(b.tsv, plainto_tsquery('english', $1)), 0.0) * 1.25 +
+                            CASE
+                                WHEN $3 <> '' THEN COALESCE(ts_rank_cd(b.tsv, websearch_to_tsquery('english', $3)), 0.0)
+                                ELSE 0.0
+                            END,
+                            0.1
+                        ) * exp(-0.01 * EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(b.last_seen_at, b.created_at))) / 86400.0)
+                    ) AS similarity
+                FROM blobs b, tsq
+                WHERE (
+                    (tsq.q <> ''::tsquery AND b.tsv @@ tsq.q)
+                    OR b.file_name ILIKE '%' || $2 || '%'
+                    OR b.file_path ILIKE '%' || $2 || '%'
+                )
+                  ${repoFilterParam4}
+                ORDER BY similarity DESC
+                LIMIT GREATEST(150, $5 * 20)
+            )
+            SELECT
+                l.id,
+                l.repository_id,
                 r.name AS project,
-                COALESCE(b.summary, substring(encode(b.content, 'escape') from 1 for 500)) AS summary,
-                b.storage_mode,
-                b.last_seen_at,
-                COALESCE(b.file_name, b.id) AS file_name,
-                b.file_path,
-                (COALESCE(ts_rank_cd(b.tsv, plainto_tsquery('simple', $1)), 0.1)
-                    * exp(-0.01 * EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(b.last_seen_at, b.created_at))) / 86400.0))
-                AS similarity
-            FROM blobs b
-            JOIN repositories r ON r.id = b.repository_id
-            WHERE (b.tsv @@ plainto_tsquery('simple', $1) 
-                   OR b.file_name ILIKE '%' || $2 || '%' 
-                   OR b.file_path ILIKE '%' || $2 || '%')
+                COALESCE(l.summary, substring(encode(full_b.content, 'escape') from 1 for 500)) AS summary,
+                l.symbol_spine,
+                l.storage_mode,
+                l.last_seen_at,
+                COALESCE(l.file_name, l.id) AS file_name,
+                l.file_path,
+                l.similarity
+            FROM lexical_raw l
+            JOIN blobs full_b ON full_b.id = l.id
+            JOIN repositories r ON r.id = l.repository_id
+            WHERE l.file_path IS NULL OR NOT EXISTS (
+                SELECT 1 FROM blobs b2
+                WHERE b2.repository_id = l.repository_id
+                  AND b2.file_path = l.file_path
+                  AND (
+                      COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) > COALESCE(l.last_seen_at, l.created_at, '-infinity'::timestamptz)
+                      OR (
+                          COALESCE(b2.last_seen_at, b2.created_at, '-infinity'::timestamptz) = COALESCE(l.last_seen_at, l.created_at, '-infinity'::timestamptz)
+                          AND b2.id > l.id
+                      )
+                  )
+            )
+            ORDER BY l.similarity DESC
+            LIMIT $5;
         `;
-        const params = [textQuery, escapedLike];
-        if (repositoryId !== undefined && repositoryId !== null) {
-            params.push(repositoryId);
-            sql += ` AND b.repository_id = $${params.length}`;
+        const params = [textQuery, escapedLike, expandedQuery, scopedRepoId, safeLimit];
+        const res = await queryWithLegacySchemaFallback(sql, params, () => ({
+            sql: sql
+                .replace(/b\.symbol_spine,/g, 'NULL::text AS symbol_spine,')
+                .replace(/l\.symbol_spine,/g, 'NULL::text AS symbol_spine,'),
+            params
+        }));
+        if (shouldBridge && res.rows.length > 0) {
+            return await expandCodeGraphBridges(res.rows, textQuery, {
+                queryFn: query,
+                repositoryId: scopedRepoId,
+                limit: safeLimit
+            });
         }
-        params.push(safeLimit);
-        sql += ` ORDER BY similarity DESC LIMIT $${params.length}`;
-
-        const res = await query(sql, params);
         return res.rows;
     }
 
@@ -497,8 +720,9 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
         try {
             const qVec = await getEmbedding(rawQuery, PRIORITY.HIGH, { mode: 'query' });
             if (Array.isArray(qVec) && qVec.length > 0) {
+                const activeModel = getActiveEmbedModel();
                 const vecLiteral = `[${qVec.join(',')}]`;
-                const semParams = [vecLiteral];
+                const semParams = [vecLiteral, activeModel];
                 let semSql = `
                     SELECT
                         sym.id,
@@ -517,6 +741,7 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
                     FROM code_symbols sym
                     JOIN repositories r ON r.id = sym.repository_id
                     WHERE sym.embedding IS NOT NULL
+                      AND (sym.embed_model IS NULL OR sym.embed_model = $2)
                 `;
                 if (repositoryId) {
                     semParams.push(repositoryId);
@@ -528,13 +753,51 @@ export async function searchSymbols(queryText, limit = 10, repositoryId = null, 
                 }
                 semParams.push((safeLimit - uniqueRows.length) * 2);
                 semSql += ` ORDER BY sym.embedding <=> $1::vector ASC LIMIT $${semParams.length}`;
-                const semRes = await query(semSql, semParams);
+                const semRes = await queryWithLegacySchemaFallback(semSql, semParams, () => {
+                    const legacyParams = [vecLiteral];
+                    let legacySql = `
+                        SELECT
+                            sym.id,
+                            sym.blob_id,
+                            sym.repository_id,
+                            r.name AS project,
+                            sym.file_path,
+                            sym.symbol_name,
+                            sym.symbol_type,
+                            sym.start_line,
+                            sym.end_line,
+                            sym.signature,
+                            sym.content,
+                            sym.symbol_hash,
+                            (1 - (sym.embedding <=> $1::vector)) AS similarity
+                        FROM code_symbols sym
+                        JOIN repositories r ON r.id = sym.repository_id
+                        WHERE sym.embedding IS NOT NULL
+                    `;
+                    if (repositoryId) {
+                        legacyParams.push(repositoryId);
+                        legacySql += ` AND sym.repository_id = $${legacyParams.length}`;
+                    }
+                    if (symbolType) {
+                        legacyParams.push(symbolType);
+                        legacySql += ` AND sym.symbol_type = $${legacyParams.length}`;
+                    }
+                    legacyParams.push((safeLimit - uniqueRows.length) * 2);
+                    legacySql += ` ORDER BY sym.embedding <=> $1::vector ASC LIMIT $${legacyParams.length}`;
+                    return { sql: legacySql, params: legacyParams };
+                });
                 for (const row of semRes.rows) {
-                    if (Number(row.similarity) < 0.35) continue;
+                    const rawSim = Number(row.similarity);
+                    const calibratedSim = calibrateQuerySimilarity(rawSim, { model: activeModel, queryVec: qVec });
+                    if (rawSim < 0.35 && calibratedSim < 0.55) continue;
                     const key = `${row.repository_id}:${row.file_path}:${row.symbol_name}:${row.symbol_type}:${row.start_line}`;
                     if (!seen.has(key)) {
                         seen.add(key);
-                        uniqueRows.push(row);
+                        uniqueRows.push({
+                            ...row,
+                            raw_similarity: rawSim,
+                            similarity: calibratedSim
+                        });
                         if (uniqueRows.length >= safeLimit) break;
                     }
                 }

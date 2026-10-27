@@ -6,7 +6,18 @@ import path from 'path';
 import crypto from 'crypto';
 import { query, pool } from '../db/pool.js';
 import { hashContent } from '../server/git-engine.js';
-import { getEmbedding, getEmbeddingsBatch, getChunkedCentroidEmbedding, isEmbeddable, MAX_EMBED_CHARS, ollamaQueue, PRIORITY } from '../lib/embedding.js';
+import {
+    getEmbedding,
+    getEmbeddingsBatch,
+    getChunkedCentroidEmbedding,
+    canonicalizeEmbedModel,
+    getActiveEmbedModel,
+    formatChunkHeader,
+    isEmbeddable,
+    MAX_EMBED_CHARS,
+    ollamaQueue,
+    PRIORITY
+} from '../lib/embedding.js';
 import { extractSymbolsAndImports, extractCompactSymbolTokens, computeSymbolHash } from '../lib/ast-chunker.js';
 import { resolveSummaryModel } from '../config/ollama.js';
 
@@ -19,6 +30,47 @@ const MAX_EMBEDDABLE_SIZE = 500 * 1024; // 500KB
 
 export function createSyncProgress() {
     return { processed: 0, total: 0, embedded: 0, skipped: 0, symbols: 0, edges: 0 };
+}
+
+/**
+ * Build a deduplicated space-joined AST symbol spine (plus route path/signature tokens)
+ * capped at `maxChars` characters for `blobs.symbol_spine` lexical indexing.
+ */
+export function buildSymbolSpine(symbols = [], maxChars = 4000) {
+    if (!Array.isArray(symbols) || symbols.length === 0 || !(maxChars > 0)) {
+        return '';
+    }
+    const seen = new Set();
+    const parts = [];
+    const addPart = (raw) => {
+        const cleaned = String(raw || '').replace(/\s+/g, ' ').trim();
+        if (!cleaned || seen.has(cleaned)) return;
+        seen.add(cleaned);
+        parts.push(cleaned);
+    };
+
+    for (const sym of symbols) {
+        if (!sym || typeof sym !== 'object') continue;
+        const name = String(sym.name || sym.symbol_name || '').trim();
+        const type = String(sym.type || sym.symbol_type || '').trim();
+        if (name) {
+            addPart(name);
+        }
+        if (type === 'route') {
+            const routeSource = [name, sym.signature, sym.path]
+                .filter(Boolean)
+                .join(' ');
+            const routeTokens = routeSource.split(/[\s/,:{}()'"`[\]@?=&#*+!~<>|\\]+/);
+            for (const tok of routeTokens) {
+                if (tok && tok.length >= 2 && tok !== 'def' && tok !== 'async' && tok !== 'function') {
+                    addPart(tok);
+                }
+            }
+        }
+    }
+
+    const joined = parts.join(' ');
+    return joined.length > maxChars ? joined.slice(0, maxChars) : joined;
 }
 
 
@@ -94,15 +146,18 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
     const embedBatchFn = options.embedBatchFn || getEmbeddingsBatch;
     const progress = options.progress || createSyncProgress();
     const shouldEmbedSymbols = options.embedSymbols === true || process.env.EMBED_CODE_SYMBOLS === 'true';
+    const activeModel = shouldEmbedSymbols ? canonicalizeEmbedModel(options.embedModel || getActiveEmbedModel()) : null;
     const client = await activePool.connect();
     try {
         const text = buffer.toString('utf-8');
         const { symbols, imports } = extractFn(text, relativePath);
+        const symbolSpine = buildSymbolSpine(symbols);
         
         await client.query('BEGIN');
         // Always purge stale symbols & edges scoped strictly to this repository
         await client.query(`DELETE FROM code_symbols WHERE repository_id = $2 AND (blob_id = $1 OR file_path = $3)`, [sha, repoId, relativePath]);
         await client.query(`DELETE FROM code_symbol_edges WHERE repository_id = $2 AND (source_blob_id = $1 OR source_path = $3)`, [sha, repoId, relativePath]);
+        await client.query('UPDATE blobs SET symbol_spine = $2 WHERE id = $1', [sha, symbolSpine || null]);
 
         if (symbols && symbols.length > 0) {
             const usePointerTokens = process.env.SYMBOL_STORAGE_MODE !== 'full';
@@ -117,7 +172,7 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
                     const symbolInputs = batch.map(
                         (sym) => `${relativePath} :: ${sym.type} ${sym.name}\n${sym.signature || ''}\n${(sym.content || '').slice(0, 950)}`
                     );
-                    const symbolVectors = await embedBatchFn(symbolInputs, PRIORITY.LOW);
+                    const symbolVectors = await embedBatchFn(symbolInputs, PRIORITY.LOW, { model: activeModel });
                     for (let sIdx = 0; sIdx < batch.length; sIdx++) {
                         const sym = batch[sIdx];
                         const storedContent = usePointerTokens
@@ -126,12 +181,13 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
                         const symHash = sym.symbol_hash || sym.symbolHash || computeSymbolHash(sym.content || sym.signature || sym.name);
                         const vec = symbolVectors?.[sIdx];
                         const vecStr = Array.isArray(vec) && vec.length > 0 ? `[${vec.join(',')}]` : null;
-                        values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9}, $${pIdx+10}::vector)`);
-                        params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash, vecStr);
-                        pIdx += 11;
+                        const symEmbedModel = vecStr ? activeModel : null;
+                        values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9}, $${pIdx+10}::vector, $${pIdx+11})`);
+                        params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash, vecStr, symEmbedModel);
+                        pIdx += 12;
                     }
                     await client.query(`
-                        INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash, embedding)
+                        INSERT INTO code_symbols (blob_id, repository_id, file_path, symbol_name, symbol_type, start_line, end_line, signature, content, symbol_hash, embedding, embed_model)
                         VALUES ${values.join(', ')}
                     `, params);
                 } else {
@@ -187,46 +243,67 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
     }
 }
 
-async function insertBlob(repoId, buffer, filePath, rootDir, progress = createSyncProgress()) {
+export async function insertBlob(repoId, buffer, filePath, rootDir, progress = createSyncProgress(), repoName = null, options = {}) {
     if (!Buffer.isBuffer(buffer) || !filePath || typeof filePath !== 'string' || filePath.includes('\0')) {
         throw new Error(`Invalid buffer or filePath passed to insertBlob: ${String(filePath)}`);
     }
+    const queryFn = options.queryFn || query;
+    const embedCentroidFn = options.embedCentroidFn || getChunkedCentroidEmbedding;
     const sha = hashContent(buffer);
     const ext = path.extname(filePath).toLowerCase();
     const fileName = path.basename(filePath);
     const relativePath = path.relative(rootDir, filePath);
+    const activeModel = canonicalizeEmbedModel(options.embedModel || getActiveEmbedModel());
+    const resolvedRepoName = repoName || path.basename(path.resolve(String(rootDir || '')));
     
-    // Check if the blob already exists to avoid re-embedding
-    const existing = await query(`SELECT id, embedding FROM blobs WHERE id = $1`, [sha]);
+    // Check if the blob already exists to avoid re-embedding unless missing or stale model re-embed requested
+    const existing = await queryFn(`SELECT id, embedding, embed_model, symbol_spine FROM blobs WHERE id = $1`, [sha]);
     if (existing.rows.length > 0) {
-        await query(`UPDATE blobs SET last_seen_at = CURRENT_TIMESTAMP, file_name = COALESCE(file_name, $2), file_path = COALESCE(file_path, $3) WHERE id = $1`, [sha, fileName, relativePath]);
-        
-        // Refresh symbols if missing, if symbol_hash is missing, if EMBED_CODE_SYMBOLS=true and embedding is missing, or if single-line brace bug exists
-        const shouldEmbedSymbols = process.env.EMBED_CODE_SYMBOLS === 'true';
-        const symCheck = await query(
-            shouldEmbedSymbols
-                ? `
-            SELECT count(*)::int AS cnt,
-                   count(*) FILTER (WHERE symbol_hash IS NULL OR embedding IS NULL OR (symbol_type IN ('function', 'class', 'method') AND start_line = end_line))::int AS stale_cnt
-            FROM code_symbols
-            WHERE blob_id = $1 AND repository_id = $2 AND file_path = $3
-        `
-                : `
-            SELECT count(*)::int AS cnt,
-                   count(*) FILTER (WHERE symbol_hash IS NULL OR (symbol_type IN ('function', 'class', 'method') AND start_line = end_line))::int AS stale_cnt
-            FROM code_symbols
-            WHERE blob_id = $1 AND repository_id = $2 AND file_path = $3
-        `,
-            [sha, repoId, relativePath]
+        const existingRow = existing.rows[0];
+        await queryFn(
+            `UPDATE blobs SET last_seen_at = CURRENT_TIMESTAMP, file_name = COALESCE(file_name, $2), file_path = COALESCE(file_path, $3) WHERE id = $1`,
+            [sha, fileName, relativePath]
         );
-        if (symCheck.rows[0].cnt === 0 || symCheck.rows[0].stale_cnt > 0) {
-            await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, { progress });
-        }
 
-        if (existing.rows[0].embedding !== null) {
+        const staleModelReembed = process.env.REEMBED_STALE_MODEL === 'true' && existingRow.embed_model !== activeModel;
+        const shouldReembed = isEmbeddable(ext) && (existingRow.embedding === null || staleModelReembed);
+
+        if (!shouldReembed) {
+            if (isEmbeddable(ext)) {
+                // Refresh symbols if missing, if symbol_spine is missing, if symbol_hash is missing,
+                // if EMBED_CODE_SYMBOLS=true and embedding/embed_model is missing, or if single-line brace bug exists
+                const shouldEmbedSymbols = options.embedSymbols === true || process.env.EMBED_CODE_SYMBOLS === 'true';
+                const symCheck = await queryFn(
+                    shouldEmbedSymbols
+                        ? `
+                    SELECT count(*)::int AS cnt,
+                           count(*) FILTER (WHERE symbol_hash IS NULL OR embedding IS NULL OR embed_model IS DISTINCT FROM $4 OR (symbol_type IN ('function', 'class', 'method') AND start_line = end_line))::int AS stale_cnt
+                    FROM code_symbols
+                    WHERE blob_id = $1 AND repository_id = $2 AND file_path = $3
+                `
+                        : `
+                    SELECT count(*)::int AS cnt,
+                           count(*) FILTER (WHERE symbol_hash IS NULL OR (symbol_type IN ('function', 'class', 'method') AND start_line = end_line))::int AS stale_cnt
+                    FROM code_symbols
+                    WHERE blob_id = $1 AND repository_id = $2 AND file_path = $3
+                `,
+                    shouldEmbedSymbols ? [sha, repoId, relativePath, activeModel] : [sha, repoId, relativePath]
+                );
+                const symStats = symCheck.rows[0] || { cnt: 0, stale_cnt: 0 };
+                if (existingRow.symbol_spine == null || symStats.cnt === 0 || symStats.stale_cnt > 0) {
+                    await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, {
+                        progress,
+                        poolImpl: options.poolImpl,
+                        extractFn: options.extractFn,
+                        embedBatchFn: options.embedBatchFn,
+                        embedSymbols: options.embedSymbols,
+                        embedModel: activeModel
+                    });
+                }
+            }
             return sha;
         }
-        // If it exists but embedding is null, we fall through to embed it.
+        // If embedding is null or REEMBED_STALE_MODEL triggered, fall through to re-embed and upsert.
     }
 
     let embeddingStr = null;
@@ -235,31 +312,39 @@ async function insertBlob(repoId, buffer, filePath, rootDir, progress = createSy
         const text = buffer.toString('utf-8');
         // Generate summary inline using LLM, fallback to substring
         summary = await generateInlineSummary(text, fileName);
-        console.log(`[Embed] Generating semantic vector for: ${path.basename(filePath)}`);
+        console.log(`[Embed] Generating semantic vector for: ${path.basename(filePath)} (${activeModel})`);
         // Embed up to 30,000 characters to prevent endless loops on massive minified files
         const textToEmbed = text.substring(0, 30000);
-        const vector = await getChunkedCentroidEmbedding(textToEmbed);
+        const contextHeader = formatChunkHeader(resolvedRepoName, relativePath);
+        const vector = await embedCentroidFn(textToEmbed, PRIORITY.LOW, { contextHeader, model: activeModel });
         if (vector && vector.length > 0) {
             embeddingStr = `[${vector.join(',')}]`;
         }
     }
 
-    // Pointer-based storage: summary + file_path, no full content
+    // Pointer-based storage: summary + file_path + embed_model, no full content
     if (embeddingStr) {
-        await query(
-            `INSERT INTO blobs (id, repository_id, size, embedding, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4::vector, $5, $6, $7, 'pointer') ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding, file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, last_seen_at = CURRENT_TIMESTAMP`,
-            [sha, repoId, buffer.length, embeddingStr, fileName, relativePath, summary]
+        await queryFn(
+            `INSERT INTO blobs (id, repository_id, size, embedding, embed_model, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4::vector, $5, $6, $7, $8, 'pointer') ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding, embed_model = EXCLUDED.embed_model, file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, summary = COALESCE(EXCLUDED.summary, blobs.summary), last_seen_at = CURRENT_TIMESTAMP`,
+            [sha, repoId, buffer.length, embeddingStr, activeModel, fileName, relativePath, summary]
         );
         progress.embedded++;
     } else {
-        await query(
-            `INSERT INTO blobs (id, repository_id, size, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4, $5, $6, 'pointer') ON CONFLICT (id) DO UPDATE SET file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, last_seen_at = CURRENT_TIMESTAMP`,
+        await queryFn(
+            `INSERT INTO blobs (id, repository_id, size, file_name, file_path, summary, storage_mode) VALUES ($1, $2, $3, $4, $5, $6, 'pointer') ON CONFLICT (id) DO UPDATE SET file_name = EXCLUDED.file_name, file_path = EXCLUDED.file_path, summary = COALESCE(EXCLUDED.summary, blobs.summary), last_seen_at = CURRENT_TIMESTAMP`,
             [sha, repoId, buffer.length, fileName, relativePath, summary]
         );
     }
 
-    // Populate code symbols & dependency edges
-    await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, { progress });
+    // Populate code symbols, dependency edges & blobs.symbol_spine
+    await populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, {
+        progress,
+        poolImpl: options.poolImpl,
+        extractFn: options.extractFn,
+        embedBatchFn: options.embedBatchFn,
+        embedSymbols: options.embedSymbols,
+        embedModel: activeModel
+    });
 
     return sha;
 }
@@ -272,7 +357,7 @@ function hashTree(entries) {
     return crypto.createHash('sha1').update(`tree ${content.length}\0${content}`).digest('hex');
 }
 
-async function processDirectory(dirPath, repoId, rootDir, progress = createSyncProgress()) {
+async function processDirectory(dirPath, repoId, rootDir, progress = createSyncProgress(), repoName = null) {
     const resolvedDir = path.resolve(String(dirPath || ''));
     const resolvedRoot = path.resolve(String(rootDir || ''));
     if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(resolvedRoot + path.sep)) {
@@ -314,7 +399,7 @@ async function processDirectory(dirPath, repoId, rootDir, progress = createSyncP
             continue;
         }
         if (item.isDirectory()) {
-            const treeSha = await processDirectory(fullPath, repoId, rootDir, progress);
+            const treeSha = await processDirectory(fullPath, repoId, rootDir, progress, repoName);
             if (treeSha) {
                 entries.push({ type: 'tree', name: item.name, object_id: treeSha });
             }
@@ -364,7 +449,7 @@ async function processDirectory(dirPath, repoId, rootDir, progress = createSyncP
             }
             
             const buffer = await fs.readFile(fullPath);
-            const blobSha = await insertBlob(repoId, buffer, fullPath, rootDir, progress);
+            const blobSha = await insertBlob(repoId, buffer, fullPath, rootDir, progress, repoName);
             entries.push({ type: 'blob', name: item.name, object_id: blobSha });
             
             progress.processed++;
@@ -409,11 +494,12 @@ async function main() {
 Usage: node scripts/sync_to_pg.js [target_directory]
 
 Options:
-  --help, -h       Show this help message
+  --help, -h           Show this help message
 
 Environment Variables:
-  SKIP_LLM_SUMMARY Set to 'true' to disable Ollama LLM summary generation
-  DATABASE_URL     PostgreSQL connection URL
+  SKIP_LLM_SUMMARY     Set to 'true' to disable Ollama LLM summary generation
+  REEMBED_STALE_MODEL  Set to 'true' to re-embed blobs whose embed_model differs from active model
+  DATABASE_URL         PostgreSQL connection URL
 `);
         process.exit(0);
     }
@@ -447,7 +533,7 @@ Environment Variables:
     console.log(`[Repo Debug] Resolved repository ID for ${repoName}:`, repoId, `type: ${typeof repoId}`);
 
     // Process Tree
-    const rootTreeSha = await processDirectory(targetDir, repoId, targetDir, progress);
+    const rootTreeSha = await processDirectory(targetDir, repoId, targetDir, progress, repoName);
     if (!rootTreeSha) {
         console.log('Directory is empty or all ignored.');
         await pool.end();
@@ -495,7 +581,9 @@ Environment Variables:
     try {
         const health = ollamaQueue.health();
         console.log(`   Fleet: ${health.map(h => `${h.endpoint.split('//')[1]} (✓${h.successes}/✗${h.failures})`).join(', ')}`);
-    } catch (_) { /* queue may not be initialized */ }
+    } catch (err) {
+        console.warn(`   Fleet health telemetry unavailable: ${err.message}`);
+    }
     
     await pool.end();
 }
