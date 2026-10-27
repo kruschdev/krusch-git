@@ -494,18 +494,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else if (name === "krusch_git_dependency_graph") {
             const { file_path, symbol, repository_id, project, repo } = args;
 
+            let targetFilePath = file_path ? String(file_path).trim().replace(/^[/\\]+/, '') : null;
+            let targetSymbol = symbol ? String(symbol).trim() : null;
+
+            if ((targetFilePath && targetFilePath.includes('\0')) || (targetSymbol && targetSymbol.includes('\0'))) {
+                throw new McpError(ErrorCode.InvalidParams, "Invalid file_path containing null bytes.");
+            }
+
             const repoParam = repo || project;
             const hasExplicitRepo = Boolean((repoParam && String(repoParam).trim()) || (repository_id !== undefined && repository_id !== null));
             let resolvedRepoId = await resolveRepoId(repoParam, repository_id);
             if (hasExplicitRepo && !resolvedRepoId) {
                 throw new McpError(ErrorCode.InvalidParams, `Repository '${repoParam || repository_id}' not found.`);
-            }
-
-            let targetFilePath = file_path ? String(file_path).trim().replace(/^[/\\]+/, '') : null;
-            let targetSymbol = symbol ? String(symbol).trim() : null;
-
-            if (targetFilePath && targetFilePath.includes('\0')) {
-                throw new McpError(ErrorCode.InvalidParams, "Invalid file_path containing null bytes.");
             }
 
             // If symbol is passed without file_path, look up the authoritative file declaration
