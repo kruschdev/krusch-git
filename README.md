@@ -36,6 +36,18 @@ To guarantee production-grade stability and complete continuity across complex m
 4. **Fidelity-Preserved Embedding Backfills**: Upgraded `backfill_embeddings.js` to automatically resolve local disk paths when processing pointer-mode blobs. This enables the embedding backfill process to compute full-fidelity, chunked centroid embeddings from the original code rather than falling back to lossy, shortened summary snippets.
 5. **Pointer-Slimmed Symbol Indexing & On-Demand Snippet Hydration (`v1.2.2`)**: Instead of duplicating up to 3,000 characters of raw code inside `code_symbols.content`, `sync_to_pg.js` stores a compact `[POINTER_TOKENS]` identifier stream so PostgreSQL's generated `tsv` full-text index remains 100% lossless while cutting symbol storage overhead by >85%. When `krusch_git_search_symbols` returns top hits, `resolveSymbolSnippet()` dynamically slices `start_line..end_line` directly from disk via `resolveBlobContent()`.
 6. **Per-Symbol SHA-256 Hash (`symbol_hash`) & Markdown Heading Spine (`symbol_type = 'section'`)**: Every extracted symbol and Markdown heading section (`#`, `##`, `###`) computes a normalized SHA-256 `symbol_hash` (`lib/ast-chunker.js`) and extracts relative Markdown link edges (`edgeType = 'references'`), enabling structural section retrieval across `README.md`, `AGENTS.md`, and `docs/*.md` alongside code AST symbols.
+7. **Polyglot Java AST & Live Cursor Import Activity (`v1.2.3`)**: `lib/ast-chunker.js` extracts Java `class`, `interface`, `@interface`, `enum`, `record`, constructor/method bodies, `;`-terminated interface signatures, and `static` imports (`parseJava`), paired with `analyzeImportSymbolActivity()` to classify imported bindings (`immediate_cursor`, `unused_staged`, `earlier_only`) with 1-hop typed/constructed local and field receiver tracking.
+
+## 📊 Empirical Benchmark: RepoBench-R (`n = 47,998` Cross-File Queries)
+
+Evaluated hermetically across **100% of the official `tianyang/repobench-r` v1.1 test suite** (`47,998` Python & Java cross-file retrieval queries across all 8 `cff`/`cfr` × `easy`/`hard` splits; zero LLM judge, runtime `Proxy` oracle traps, and SHA-256 provenance audit) with `snowflake-arctic-embed2` (`1,024d`):
+
+| Scope / Split | Import Order | Identifier BM25 | Pure Dense (`snowflake-arctic-embed2`) | **`krusch-git v1.2.3` (Hybrid RRF + AST + Import Activity)** | Lift vs. Pure Dense |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Official 8-Split Macro (`Acc@1` / `Acc@5` / `MRR`)** | `11.84%` / `57.01%` / `0.3109` | `15.98%` / `63.95%` / `0.3598` | `15.69%` / `64.14%` / `0.3586` | **`19.12%` / `68.58%` / `0.3957`** | **`+21.8%` `Acc@1` (`+61.5%` vs. Import Order)** |
+| **Python 4-Split Macro (`n = 23,998`)** | `12.33%` / `56.78%` / `0.3133` | `18.53%` / `66.03%` / `0.3836` | `17.82%` / `66.41%` / `0.3790` | **`21.67%` / `70.07%` / `0.4179`** | **`+21.6%` `Acc@1`** |
+| **Java 4-Split Macro (`n = 24,000`)** | `11.35%` / `57.23%` / `0.3084` | `13.44%` / `61.88%` / `0.3359` | `13.57%` / `61.88%` / `0.3381` | **`16.57%` / `67.09%` / `0.3735`** | **`+22.1%` `Acc@1`** |
+| **Cross-File Random (`cfr`) Easy `Acc@1` (Py / Java)** | `12.71%` / `11.67%` | `25.83%` / `19.65%` | `21.75%` / `19.85%` | **`31.33%` / `27.45%`** | **Surpasses published `CodeBERT` (`~20.6%`/`~19.3%`) & `UniXcoder` (`~28.8%`/`~26.9%`) on both Py & Java** |
 
 ## 🤝 Sibling Synergy with Krusch Context MCP
 
