@@ -49,6 +49,20 @@ Evaluated hermetically across **100% of the official `tianyang/repobench-r` v1.1
 | **Java 4-Split Macro (`n = 24,000`)** | `11.35%` / `57.23%` / `0.3084` | `13.44%` / `61.88%` / `0.3359` | `13.57%` / `61.88%` / `0.3381` | **`16.57%` / `67.09%` / `0.3735`** | **`+22.1%` `Acc@1`** |
 | **Cross-File Random (`cfr`) Easy `Acc@1` (Py / Java)** | `12.71%` / `11.67%` | `25.83%` / `19.65%` | `21.75%` / `19.85%` | **`31.33%` / `27.45%`** | **Surpasses published `CodeBERT` (`~20.6%`/`~19.3%`) & `UniXcoder` (`~28.8%`/`~26.9%`) on both Py & Java** |
 
+## 📊 Empirical Benchmark: ACL 2025 `CoIR` (`10 / 10` Tasks — `2,389,123` Docs & `162,216` Queries)
+
+Evaluated hermetically across **100% of all `10 / 10` official ACL 2025 `CoIR` code retrieval tasks** (`20 / 20` unshrunk sub-corpora: `cosqa`, `codetrans-dl`, `codetrans-contest`, `apps`, `stackoverflow-qa`, `synthetic-text2sql`, `codefeedback-st`, `codefeedback-mt`, 6-language `codesearchnet`, and 6-language `codesearchnet-ccr`; `0` LLM judges, runtime `Proxy` oracle traps, and SHA-256 provenance audit archived at [`krush420/sovereign-g4-benchmarks`](https://huggingface.co/datasets/krush420/sovereign-g4-benchmarks)) with local-weights `snowflake-arctic-embed2:latest` (`568M` params, `1,024d`, `8,192` ctx):
+
+| Aggregation / Highlight Task | Porter `FTS5` BM25 (`NDCG@10` / `R@10`) | Pure Dense (`snowflake-arctic-embed2`) | **`krusch-git` (Hybrid RRF + AST Spine + Subtoken `FTS5`)** | Comparison vs. ACL 2025 `CoIR` Table 3 (`Li et al.`) |
+| :--- | :---: | :---: | :---: | :--- |
+| **Official 10-Task Macro Average (`NDCG@10` / `MRR@10` / `R@10`)** | `48.98%` / `44.06%` / `64.85%` | `55.65%` / `50.64%` / `71.71%` | **`56.40%` / `50.94%` / `73.88%`** | **`#1` Overall (`+0.75 pp` `NDCG@10` & `+2.17 pp` `R@10` vs. Dense)** — exceeds all `10` Table 3 models incl. `Voyage-Code-002` (`56.26%`) & `E5-Mistral 7B` (`55.18%`)* |
+| **`CodeSearchNet` (`6` Langs, `1,003,765` Docs / `52,561` Qs)** | `41.81%` / `52.77%` | `57.72%` / `70.07%` | **`59.76%` / `72.80%`** | **`+5.51 pp`** over `E5-Mistral 7B` (`54.25%`); Python AST Spine hits **`81.45%` `NDCG@10`** |
+| **`CodeFeedback-MT` (`66,383` Docs / `13,277` Multi-Turn Qs)** | `54.53%` / `63.27%` | `52.23%` / `64.86%` | **`60.23%` / `70.81%`** | **`+8.00 pp`** over Pure Dense & **`+18.24 pp`** over Table 3 best (`41.99%`; `51.32%` `GTE 4k` Table 5) |
+| **`CodeFeedback-ST` (`156,526` Docs / `31,306` Qs)** | `62.58%` / `76.45%` | `72.81%` / `89.11%` | **`74.76%` / `90.26%`** | **`#1`** vs. Table 3 best (`E5-base` `74.52%`, `E5-Mistral 7B` `72.71%`) |
+| **`Synthetic-Text2SQL` (`105,851` Docs / `5,851` Qs)** | `40.74%` / `70.91%` | `44.49%` / `77.75%` | **`48.71%` / `84.19%`** | **`+4.22 pp` `NDCG@10` & `+6.44 pp` `Recall@10`** over Pure Dense via identifier/SQL hybrid fusion |
+
+*\*Scope Note: ACL 2025 `CoIR` Table 3 truncated inputs at `512` tokens, whereas `snowflake-arctic-embed2:latest` operates at its native `8,192`-token context window.*
+
 ## 🤝 Sibling Synergy with Krusch Context MCP
 
 Krusch-Git and [krusch-context-mcp](https://github.com/kruschdev/krusch-context-mcp) form a complementary two-server architecture for AI coding agents:
