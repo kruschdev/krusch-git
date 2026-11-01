@@ -32,33 +32,55 @@ export default function App() {
 
   // Initial load: config + repositories
   useEffect(() => {
-    fetch(`${API_BASE}/api/config`)
-      .then(r => r.json())
-      .then(d => { if (d.ai?.embedModel) setEmbedModel(d.ai.embedModel); })
-      .catch(e => console.warn('Config fetch error:', e));
+    const controller = new AbortController();
 
-    fetch(`${API_BASE}/api/repos`)
+    fetch(`${API_BASE}/api/config`, { signal: controller.signal })
       .then(r => r.json())
       .then(d => {
+        if (controller.signal.aborted) return;
+        if (d.ai?.embedModel) setEmbedModel(d.ai.embedModel);
+      })
+      .catch(err => {
+        if (err?.name === 'AbortError' || controller.signal.aborted) return;
+        console.warn('Config fetch error:', err);
+      });
+
+    fetch(`${API_BASE}/api/repos`, { signal: controller.signal })
+      .then(r => r.json())
+      .then(d => {
+        if (controller.signal.aborted) return;
         const list = Array.isArray(d) ? d : [];
         setRepos(list);
         if (list.length > 0) {
           setActiveRepo(list[0]);
         }
       })
-      .catch(e => setError(`Failed to load repositories: ${e.message}`));
+      .catch(err => {
+        if (err?.name === 'AbortError' || controller.signal.aborted) return;
+        setError(`Failed to load repositories: ${err.message}`);
+      });
+
+    return () => controller.abort();
   }, []);
 
   // Load root tree when activeRepo changes
   useEffect(() => {
-    if (activeRepo) {
-      setTree([]);
-      setTreePath([]);
-      fetch(`${API_BASE}/api/repos/${activeRepo.id}/tree`)
-        .then(r => r.json())
-        .then(d => setTree(Array.isArray(d) ? d : []))
-        .catch(e => setError(`Failed to load tree: ${e.message}`));
-    }
+    if (!activeRepo) return undefined;
+    const controller = new AbortController();
+    setTree([]);
+    setTreePath([]);
+    fetch(`${API_BASE}/api/repos/${activeRepo.id}/tree`, { signal: controller.signal })
+      .then(r => r.json())
+      .then(d => {
+        if (controller.signal.aborted) return;
+        setTree(Array.isArray(d) ? d : []);
+      })
+      .catch(err => {
+        if (err?.name === 'AbortError' || controller.signal.aborted) return;
+        setError(`Failed to load tree: ${err.message}`);
+      });
+
+    return () => controller.abort();
   }, [activeRepo]);
 
   const navigateIntoSubtree = async (folderName, treeId) => {
@@ -135,10 +157,16 @@ export default function App() {
       setSearchResults([]);
       setSymbolResults([]);
       setIsSearching(false);
-      return;
+      return undefined;
     }
 
+    const controller = new AbortController();
     const timer = setTimeout(async () => {
+      if (controller.signal.aborted) return;
+      if (sidebarMode !== 'symbols' && sidebarMode !== 'search') {
+        setIsSearching(false);
+        return;
+      }
       setIsSearching(true);
       const repoParam = activeRepo ? `&repo=${activeRepo.id}` : '';
       const encodedQ = encodeURIComponent(searchQuery.trim());
@@ -146,22 +174,36 @@ export default function App() {
       try {
         if (sidebarMode === 'symbols') {
           const typeParam = symbolTypeFilter ? `&type=${symbolTypeFilter}` : '';
-          const res = await fetch(`${API_BASE}/api/symbols?q=${encodedQ}${repoParam}${typeParam}&limit=25`);
+          const res = await fetch(
+            `${API_BASE}/api/symbols?q=${encodedQ}${repoParam}${typeParam}&limit=25`,
+            { signal: controller.signal }
+          );
           const data = await res.json();
+          if (controller.signal.aborted) return;
           setSymbolResults(Array.isArray(data) ? data : []);
         } else if (sidebarMode === 'search') {
-          const res = await fetch(`${API_BASE}/api/search?q=${encodedQ}${repoParam}&limit=20`);
+          const res = await fetch(
+            `${API_BASE}/api/search?q=${encodedQ}${repoParam}&limit=20`,
+            { signal: controller.signal }
+          );
           const data = await res.json();
+          if (controller.signal.aborted) return;
           setSearchResults(Array.isArray(data) ? data : []);
         }
       } catch (err) {
+        if (err?.name === 'AbortError' || controller.signal.aborted) return;
         setError(`Search error: ${err.message}`);
       } finally {
-        setIsSearching(false);
+        if (!controller.signal.aborted) {
+          setIsSearching(false);
+        }
       }
     }, 280);
 
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [searchQuery, sidebarMode, symbolTypeFilter, activeRepo]);
 
   const handleSymbolClick = async (sym) => {

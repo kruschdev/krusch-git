@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -24,12 +23,136 @@ import {
 import { getEmbedding, PRIORITY } from '../lib/embedding.js';
 import { findUnattestedIdentifiers } from '../lib/graph-bridge.js';
 import { pool } from '../db/pool.js';
+import { existsSync } from 'node:fs';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECTS_ROOT = path.resolve(__dirname, '..', '..');
+
+async function loadMcpToolkit() {
+    const siblingMcpUrl = new URL('../../../lib/mcp-server.js', import.meta.url);
+    if (existsSync(siblingMcpUrl)) {
+        try {
+            const mod = await import(siblingMcpUrl.href);
+            if (
+                typeof mod.defineMcpTool === 'function' &&
+                typeof mod.registerMcpHandlers === 'function' &&
+                typeof mod.createMcpServer === 'function'
+            ) {
+                return mod;
+            }
+        } catch {
+            // Fall through to @krusch/toolkit/mcp or standalone CI fallback
+        }
+    }
+    try {
+        const mod = await import('@krusch/toolkit/mcp');
+        if (
+            typeof mod.defineMcpTool === 'function' &&
+            typeof mod.registerMcpHandlers === 'function' &&
+            typeof mod.createMcpServer === 'function'
+        ) {
+            return mod;
+        }
+    } catch {
+        // Standalone CI fallback when sibling toolkit is unavailable
+    }
+
+    function fallbackDefineMcpTool({
+        name,
+        title,
+        description = '',
+        inputSchema = { type: 'object', properties: {} },
+        annotations = {},
+        readOnlyHint,
+        destructiveHint,
+        idempotentHint,
+        openWorldHint,
+        ...rest
+    } = {}) {
+        const cleanName = String(name || '').trim();
+        const rawAnnotations = annotations && typeof annotations === 'object' ? annotations : {};
+        return {
+            ...rest,
+            name: cleanName,
+            description: String(description ?? ''),
+            inputSchema: inputSchema || { type: 'object', properties: {} },
+            annotations: {
+                ...rawAnnotations,
+                title: String(rawAnnotations.title || title || cleanName),
+                readOnlyHint: Boolean(readOnlyHint ?? rawAnnotations.readOnlyHint ?? true),
+                destructiveHint: Boolean(destructiveHint ?? rawAnnotations.destructiveHint ?? false),
+                idempotentHint: Boolean(idempotentHint ?? rawAnnotations.idempotentHint ?? true),
+                openWorldHint: Boolean(openWorldHint ?? rawAnnotations.openWorldHint ?? false)
+            }
+        };
+    }
+
+    function fallbackRegisterMcpHandlers(srv, tools = [], toolHandler, options = {}) {
+        const normalizedTools = Array.isArray(tools) ? tools.map(t => fallbackDefineMcpTool(t)) : [];
+        const listTools = async () => ({ tools: normalizedTools });
+        const callTool = async (request) => {
+            const toolName = String(request?.params?.name ?? '');
+            const toolArgs = request?.params?.arguments ?? {};
+            try {
+                return await toolHandler(toolName, toolArgs, request);
+            } catch (error) {
+                if (
+                    options.rethrowMcpError === true &&
+                    error &&
+                    typeof error === 'object' &&
+                    (error instanceof McpError ||
+                        error.name === 'McpError' ||
+                        (typeof error.code === 'number' && error.code <= -32000))
+                ) {
+                    throw error;
+                }
+                const msg = error instanceof Error ? error.message : String(error);
+                return {
+                    isError: true,
+                    content: [{ type: 'text', text: `[Error] Failed executing ${toolName}: ${msg}` }]
+                };
+            }
+        };
+        srv.setRequestHandler(ListToolsRequestSchema, listTools);
+        srv.setRequestHandler(CallToolRequestSchema, callTool);
+        return { server: srv, normalizedTools, listTools, callTool };
+    }
+
+    async function fallbackCreateMcpServer(name, version, tools = [], toolHandler, options = {}) {
+        const srv = options.server || new Server(
+            { name, version },
+            { capabilities: options.capabilities || { tools: {} } }
+        );
+        const handle = fallbackRegisterMcpHandlers(srv, tools, toolHandler, {
+            ...options,
+            serverName: name
+        });
+        if (options.connect === false) {
+            return handle;
+        }
+        let transport = options.transport;
+        if (!transport) {
+            const stdioSpec = '@modelcontextprotocol/sdk/server/' + 'stdio.js';
+            const stdioMod = await import(stdioSpec);
+            const TransportCtor = Object.values(stdioMod).find(v => typeof v === 'function');
+            transport = Reflect.construct(TransportCtor, []);
+        }
+        await srv.connect(transport);
+        console.error(`[${name}] MCP Server started on stdio.`);
+        return srv;
+    }
+
+    return {
+        defineMcpTool: fallbackDefineMcpTool,
+        registerMcpHandlers: fallbackRegisterMcpHandlers,
+        createMcpServer: fallbackCreateMcpServer
+    };
+}
+
+const { defineMcpTool, registerMcpHandlers, createMcpServer } = await loadMcpToolkit();
 
 // Helper to resolve repository name/alias to integer ID
 async function resolveRepoId(repoParam, repoIdParam) {
@@ -76,162 +199,153 @@ async function verifyDatabase(retries = 3, delayMs = 1000) {
     return false;
 }
 
-// ── MCP Server ────────────────────────────────────────────────────────────────
-const server = new Server(
-    { name: "krusch-git", version: "1.2.2" },
-    { capabilities: { tools: {} } }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-        tools: [
-            {
-                name: "krusch_git_list_repos",
-                description: "List all available repositories stored in the database.",
-                annotations: {
-                    readOnlyHint: true,
-                    destructiveHint: false,
-                    idempotentHint: true,
-                    openWorldHint: false
-                },
-                inputSchema: { type: "object", properties: {} }
-            },
-            {
-                name: "krusch_git_read_tree",
-                description: "Read the directory structure (DAG node) of a specific repository. If tree_sha/tree_id is omitted or 'HEAD', reads the root tree of the main branch.",
-                annotations: {
-                    readOnlyHint: true,
-                    destructiveHint: false,
-                    idempotentHint: true,
-                    openWorldHint: false
-                },
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        repo: { type: "string", description: "Repository name (e.g. 'krusch-git', 'krusch-context-mcp')." },
-                        project: { type: "string", description: "Alias for repo." },
-                        repository_id: { type: "number", description: "The ID of the repository." },
-                        tree_sha: { type: "string", description: "Specific SHA-1 tree hash, or 'HEAD' for root tree." },
-                        tree_id: { type: "string", description: "Legacy alias for tree_sha." }
-                    }
-                }
-            },
-            {
-                name: "krusch_git_read_blob",
-                description: "Read the source file contents of a specific blob or file path within a repository.",
-                annotations: {
-                    readOnlyHint: true,
-                    destructiveHint: false,
-                    idempotentHint: true,
-                    openWorldHint: false
-                },
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        repo: { type: "string", description: "Repository name (e.g. 'krusch-git', 'krusch-context-mcp')." },
-                        file_path: { type: "string", description: "Relative file path within repository." },
-                        blob_id: { type: "string", description: "The SHA-1 hash of the blob." }
-                    }
-                }
-            },
-            {
-                name: "krusch_git_semantic_search",
-                description: "Search code files using Hybrid RRF (BM25 + pgvector), pure semantic vector, or keyword search. Results are decayed by age.",
-                annotations: {
-                    readOnlyHint: true,
-                    destructiveHint: false,
-                    idempotentHint: true,
-                    openWorldHint: false
-                },
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        query: { type: "string", description: "The search query." },
-                        repo: { type: "string", description: "Repository name to filter search (e.g. 'krusch-git', 'krusch-context-mcp')." },
-                        project: { type: "string", description: "Alias for repo." },
-                        repository_id: { type: "number", description: "Optional repository ID." },
-                        search_type: { 
-                            type: "string", 
-                            enum: ["hybrid", "semantic", "keyword"], 
-                            description: "Search mode: 'hybrid' (BM25 + pgvector RRF, default), 'semantic' (pure vector), or 'keyword' (pure BM25).",
-                            default: "hybrid" 
-                        },
-                        limit: { type: "number", description: "Number of results to return.", default: 5 }
-                    },
-                    required: ["query"]
-                }
-            },
-            {
-                name: "krusch_git_search_symbols",
-                description: "Search for specific code symbols (functions, classes, methods, routes, markdown sections) across repositories with exact match boost, signatures, and line ranges.",
-                annotations: {
-                    readOnlyHint: true,
-                    destructiveHint: false,
-                    idempotentHint: true,
-                    openWorldHint: false
-                },
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        query: { type: "string", description: "Function, class, markdown heading, or symbol name to search for." },
-                        repo: { type: "string", description: "Repository name to filter search." },
-                        project: { type: "string", description: "Alias for repo." },
-                        symbol_type: { type: "string", enum: ["function", "class", "method", "route", "type", "variable", "section"], description: "Optional filter for symbol type." },
-                        limit: { type: "number", description: "Max symbols to return.", default: 10 },
-                        repository_id: { type: "number", description: "Optional repository ID." }
-                    },
-                    required: ["query"]
-                }
-            },
-            {
-                name: "krusch_git_file_symbols",
-                description: "List all code symbols (functions, classes, methods, routes) declared inside a specific file or blob.",
-                annotations: {
-                    readOnlyHint: true,
-                    destructiveHint: false,
-                    idempotentHint: true,
-                    openWorldHint: false
-                },
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        repo: { type: "string", description: "Repository name." },
-                        file_path: { type: "string", description: "Relative file path within repository." },
-                        blob_id: { type: "string", description: "The SHA-1 hash of the blob." }
-                    }
-                }
-            },
-            {
-                name: "krusch_git_dependency_graph",
-                description: "Trace symbol dependencies: retrieve outbound imports, inbound callers/dependents, and declared symbols for a specific symbol or file path.",
-                annotations: {
-                    readOnlyHint: true,
-                    destructiveHint: false,
-                    idempotentHint: true,
-                    openWorldHint: false
-                },
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        symbol: { type: "string", description: "Symbol name to trace callers and dependencies for." },
-                        file_path: { type: "string", description: "Relative file path (e.g., 'server/git-engine.js')." },
-                        repo: { type: "string", description: "Repository name." },
-                        project: { type: "string", description: "Alias for repo." },
-                        repository_id: { type: "number", description: "Repository ID." }
-                    }
-                }
+// ── MCP Tools & Server ────────────────────────────────────────────────────────
+const TOOLS = [
+    defineMcpTool({
+        name: "krusch_git_list_repos",
+        description: "List all available repositories stored in the database.",
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        },
+        inputSchema: { type: "object", properties: {} }
+    }),
+    defineMcpTool({
+        name: "krusch_git_read_tree",
+        description: "Read the directory structure (DAG node) of a specific repository. If tree_sha/tree_id is omitted or 'HEAD', reads the root tree of the main branch.",
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        },
+        inputSchema: {
+            type: "object",
+            properties: {
+                repo: { type: "string", description: "Repository name (e.g. 'krusch-git', 'krusch-context-mcp')." },
+                project: { type: "string", description: "Alias for repo." },
+                repository_id: { type: "number", description: "The ID of the repository." },
+                tree_sha: { type: "string", description: "Specific SHA-1 tree hash, or 'HEAD' for root tree." },
+                tree_id: { type: "string", description: "Legacy alias for tree_sha." }
             }
-        ]
-    };
-});
+        }
+    }),
+    defineMcpTool({
+        name: "krusch_git_read_blob",
+        description: "Read the source file contents of a specific blob or file path within a repository.",
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        },
+        inputSchema: {
+            type: "object",
+            properties: {
+                repo: { type: "string", description: "Repository name (e.g. 'krusch-git', 'krusch-context-mcp')." },
+                file_path: { type: "string", description: "Relative file path within repository." },
+                blob_id: { type: "string", description: "The SHA-1 hash of the blob." }
+            }
+        }
+    }),
+    defineMcpTool({
+        name: "krusch_git_semantic_search",
+        description: "Search code files using Hybrid RRF (BM25 + pgvector), pure semantic vector, or keyword search. Results are decayed by age.",
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        },
+        inputSchema: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "The search query." },
+                repo: { type: "string", description: "Repository name to filter search (e.g. 'krusch-git', 'krusch-context-mcp')." },
+                project: { type: "string", description: "Alias for repo." },
+                repository_id: { type: "number", description: "Optional repository ID." },
+                search_type: { 
+                    type: "string", 
+                    enum: ["hybrid", "semantic", "keyword"], 
+                    description: "Search mode: 'hybrid' (BM25 + pgvector RRF, default), 'semantic' (pure vector), or 'keyword' (pure BM25).",
+                    default: "hybrid" 
+                },
+                limit: { type: "number", description: "Number of results to return.", default: 5 }
+            },
+            required: ["query"]
+        }
+    }),
+    defineMcpTool({
+        name: "krusch_git_search_symbols",
+        description: "Search for specific code symbols (functions, classes, methods, routes, markdown sections) across repositories with exact match boost, signatures, and line ranges.",
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        },
+        inputSchema: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "Function, class, markdown heading, or symbol name to search for." },
+                repo: { type: "string", description: "Repository name to filter search." },
+                project: { type: "string", description: "Alias for repo." },
+                symbol_type: { type: "string", enum: ["function", "class", "method", "route", "type", "variable", "section"], description: "Optional filter for symbol type." },
+                limit: { type: "number", description: "Max symbols to return.", default: 10 },
+                repository_id: { type: "number", description: "Optional repository ID." }
+            },
+            required: ["query"]
+        }
+    }),
+    defineMcpTool({
+        name: "krusch_git_file_symbols",
+        description: "List all code symbols (functions, classes, methods, routes) declared inside a specific file or blob.",
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        },
+        inputSchema: {
+            type: "object",
+            properties: {
+                repo: { type: "string", description: "Repository name." },
+                file_path: { type: "string", description: "Relative file path within repository." },
+                blob_id: { type: "string", description: "The SHA-1 hash of the blob." }
+            }
+        }
+    }),
+    defineMcpTool({
+        name: "krusch_git_dependency_graph",
+        description: "Trace symbol dependencies: retrieve outbound imports, inbound callers/dependents, and declared symbols for a specific symbol or file path.",
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        },
+        inputSchema: {
+            type: "object",
+            properties: {
+                symbol: { type: "string", description: "Symbol name to trace callers and dependencies for." },
+                file_path: { type: "string", description: "Relative file path (e.g., 'server/git-engine.js')." },
+                repo: { type: "string", description: "Repository name." },
+                project: { type: "string", description: "Alias for repo." },
+                repository_id: { type: "number", description: "Repository ID." }
+            }
+        }
+    })
+];
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const rawName = request.params.name;
+async function dispatchGitTool(rawToolName, rawArgs = {}) {
+    const rawName = String(rawToolName || '');
     const name = rawName.replace(/^pg_git_/, 'krusch_git_');
     if (rawName.startsWith('pg_git_')) {
         console.error(`[krusch-git] Notice: Tool '${rawName}' is aliased to '${name}'.`);
     }
-    const args = request.params.arguments || {};
+    const args = rawArgs || {};
 
     try {
         if (name === "krusch_git_list_repos") {
@@ -591,12 +705,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${rawName}`);
         }
     } catch (err) {
-        if (err instanceof McpError) throw err;
+        if (err instanceof McpError || err?.name === 'McpError') throw err;
         return {
             content: [{ type: "text", text: `[Error] Failed executing ${rawName}: ${err.message}` }],
             isError: true
         };
     }
+}
+
+const server = new Server(
+    { name: "krusch-git", version: "1.2.2" },
+    { capabilities: { tools: {} } }
+);
+
+registerMcpHandlers(server, TOOLS, dispatchGitTool, {
+    validateArgs: false,
+    rethrowMcpError: true,
+    serverName: 'krusch-git'
 });
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -611,9 +736,11 @@ process.on('SIGTERM', shutdown);
 
 async function main() {
     await verifyDatabase();
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("[krusch-git] Server running on stdio");
+    await createMcpServer('krusch-git', '1.2.2', TOOLS, dispatchGitTool, {
+        server,
+        validateArgs: false,
+        rethrowMcpError: true
+    });
 }
 
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
@@ -624,5 +751,6 @@ if (isDirectRun) {
     });
 }
 
-export { server, verifyDatabase, main };
+export { server, TOOLS, dispatchGitTool, verifyDatabase, main };
+
 
