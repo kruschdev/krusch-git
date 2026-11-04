@@ -30,7 +30,7 @@ Instead, Krusch-Git is an **agentic augmentation layer**. You continue to use st
 
 To guarantee production-grade stability and complete continuity across complex monorepos, Krusch-Git underwent a thorough architectural audit and reliability overhaul:
 
-1. **Deterministic Pointer Resolution**: In standard `'pointer'` storage mode (used to keep the database lightweight), file content is stored as `NULL` in PostgreSQL. We introduced a dynamic resolver inside `server/git-engine.js` that maps relative blob paths to the local filesystem monorepo root. This automatically streams raw file contents from disk on demand, resolving previous `null` value crashes on the Express `/api/blobs/:id` route and `krusch_git_read_blob` MCP tool.
+1. **Deterministic Pointer Resolution**: In standard `'pointer'` storage mode (used to keep the database lightweight), file content is stored as `NULL` in PostgreSQL. I introduced a dynamic resolver inside `server/git-engine.js` that maps relative blob paths to the local filesystem monorepo root. This automatically streams raw file contents from disk on demand, resolving previous `null` value crashes on the Express `/api/blobs/:id` route and `krusch_git_read_blob` MCP tool.
 2. **Safe Semantic Search Previews**: Standard semantic search tool calls throw TypeErrors if they attempt to stringify nullable database columns. Krusch-Git now safely extracts the pre-compiled `summary` column (generated using `qwen2.5-coder:7b` inline summaries) to serve as the context preview.
 3. **Starvation-Proof Queue Management**: The fleet priority queue (`PriorityQueue.process`) inside `lib/llm-queue.js` is secured using a strict `try ... finally` block. This guarantees that concurrent slots are cleanly released (`this.active--`) under all task outcomes, preventing memory and slot leaks that would otherwise block multi-agent swarm operations.
 4. **Fidelity-Preserved Embedding Backfills**: Upgraded `backfill_embeddings.js` to automatically resolve local disk paths when processing pointer-mode blobs. This enables the embedding backfill process to compute full-fidelity, chunked centroid embeddings from the original code rather than falling back to lossy, shortened summary snippets.
@@ -154,7 +154,7 @@ When running Krusch-Git as an MCP server (`server/mcp.js`), it exposes 7 canonic
 Speak to your IDE agent normally. It will use the standalone MCP tools to interface with the database:
 
 **Example 1: Finding specific logic**
-> **You:** "Where do we handle the temporal decay for the memory MCP?"
+> **You:** "Where does the codebase handle temporal decay for the memory MCP?"
 > **Agent:** *[Calls `krusch_git_semantic_search`]* "I found the logic in `server/git-engine.js`. It uses the `exp(-0.01 * age_in_days)` formula in `searchBlobs()`."
 
 **Example 2: Reading a repository tree**
