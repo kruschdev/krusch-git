@@ -21,7 +21,7 @@ import {
 import { extractSymbolsAndImports, extractCompactSymbolTokens, computeSymbolHash } from '../lib/ast-chunker.js';
 import { resolveSummaryModel } from '../config/ollama.js';
 
-const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', 'data', 'tmp', '.gemini', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
+const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', '.ruff_cache', '.mypy_cache', 'data', 'tmp', '.gemini', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
 
 /** Max file size for non-embeddable files (skip large binaries like .zip entirely) */
 const MAX_BINARY_SIZE = 100 * 1024; // 100KB
@@ -182,8 +182,9 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
                         const vec = symbolVectors?.[sIdx];
                         const vecStr = Array.isArray(vec) && vec.length > 0 ? `[${vec.join(',')}]` : null;
                         const symEmbedModel = vecStr ? activeModel : null;
+                        const safeSymName = String(sym.name || '').slice(0, 255);
                         values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9}, $${pIdx+10}::vector, $${pIdx+11})`);
-                        params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash, vecStr, symEmbedModel);
+                        params.push(sha, repoId, relativePath, safeSymName, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash, vecStr, symEmbedModel);
                         pIdx += 12;
                     }
                     await client.query(`
@@ -196,8 +197,9 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
                             ? `[POINTER_TOKENS]\n${extractCompactSymbolTokens(sym.content, sym.signature)}`
                             : sym.content;
                         const symHash = sym.symbol_hash || sym.symbolHash || computeSymbolHash(sym.content || sym.signature || sym.name);
+                        const safeSymName = String(sym.name || '').slice(0, 255);
                         values.push(`($${pIdx}, $${pIdx+1}, $${pIdx+2}, $${pIdx+3}, $${pIdx+4}, $${pIdx+5}, $${pIdx+6}, $${pIdx+7}, $${pIdx+8}, $${pIdx+9})`);
-                        params.push(sha, repoId, relativePath, sym.name, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash);
+                        params.push(sha, repoId, relativePath, safeSymName, sym.type, sym.startLine, sym.endLine, sym.signature, storedContent, symHash);
                         pIdx += 10;
                     }
                     await client.query(`
@@ -265,11 +267,12 @@ export async function insertBlob(repoId, buffer, filePath, rootDir, progress = c
             [sha, fileName, relativePath]
         );
 
+        const hasSubstantiveText = isEmbeddable(ext) && buffer.length > 0 && buffer.toString('utf-8').trim().length > 0;
         const staleModelReembed = process.env.REEMBED_STALE_MODEL === 'true' && existingRow.embed_model !== activeModel;
-        const shouldReembed = isEmbeddable(ext) && (existingRow.embedding === null || staleModelReembed);
+        const shouldReembed = hasSubstantiveText && (existingRow.embedding === null || staleModelReembed);
 
         if (!shouldReembed) {
-            if (isEmbeddable(ext)) {
+            if (hasSubstantiveText) {
                 // Refresh symbols if missing, if symbol_spine is missing, if symbol_hash is missing,
                 // if EMBED_CODE_SYMBOLS=true and embedding/embed_model is missing, or if single-line brace bug exists
                 const shouldEmbedSymbols = options.embedSymbols === true || process.env.EMBED_CODE_SYMBOLS === 'true';
@@ -310,15 +313,17 @@ export async function insertBlob(repoId, buffer, filePath, rootDir, progress = c
     let summary = null;
     if (isEmbeddable(ext)) {
         const text = buffer.toString('utf-8');
-        // Generate summary inline using LLM, fallback to substring
-        summary = await generateInlineSummary(text, fileName);
-        console.log(`[Embed] Generating semantic vector for: ${path.basename(filePath)} (${activeModel})`);
-        // Embed up to 30,000 characters to prevent endless loops on massive minified files
-        const textToEmbed = text.substring(0, 30000);
-        const contextHeader = formatChunkHeader(resolvedRepoName, relativePath);
-        const vector = await embedCentroidFn(textToEmbed, PRIORITY.LOW, { contextHeader, model: activeModel });
-        if (vector && vector.length > 0) {
-            embeddingStr = `[${vector.join(',')}]`;
+        if (text.trim().length > 0) {
+            // Generate summary inline using LLM, fallback to substring
+            summary = await generateInlineSummary(text, fileName);
+            console.log(`[Embed] Generating semantic vector for: ${path.basename(filePath)} (${activeModel})`);
+            // Embed up to 30,000 characters to prevent endless loops on massive minified files
+            const textToEmbed = text.substring(0, 30000);
+            const contextHeader = formatChunkHeader(resolvedRepoName, relativePath);
+            const vector = await embedCentroidFn(textToEmbed, PRIORITY.LOW, { contextHeader, model: activeModel });
+            if (vector && vector.length > 0) {
+                embeddingStr = `[${vector.join(',')}]`;
+            }
         }
     }
 
@@ -382,20 +387,28 @@ async function processDirectory(dirPath, repoId, rootDir, progress = createSyncP
         const fullPath = path.join(dirPath, item.name);
         const relPath = path.relative(rootDir, fullPath);
         
-        // Exclude large archives, reference checkouts, and giant third-party codebases to prevent scanning bloat
+        // Exclude large archives, raw benchmark trace dumps, reference checkouts, and giant third-party codebases to prevent scanning bloat
         const pathsToExclude = [
+            'benchmarks/dolphinbench/runs',
+            'benchmarks/dolphinbench/upstream',
             'docs/projects',
             'projects/archive',
             'projects/reference',
             'projects/vllm',
             'projects/vllm-hermes',
+            'projects/LEANN',
+            'projects/krusch-cascade-router/benchmark',
             'projects/TheAgentCompany',
             'projects/agent-toolkit-for-aws',
             'projects/Brain3',
             'projects/searxng',
             'projects/dbos-worker'
         ];
-        if (pathsToExclude.some(p => relPath === p || relPath.startsWith(p + '/'))) {
+        const effectiveRepoName = repoName || path.basename(resolvedRoot);
+        if (
+            pathsToExclude.some(p => relPath === p || relPath.startsWith(p + '/')) ||
+            (effectiveRepoName === 'krusch-cascade-router' && (relPath === 'benchmark' || relPath.startsWith('benchmark/')))
+        ) {
             continue;
         }
         if (item.isDirectory()) {
