@@ -17,14 +17,14 @@ async function migrate() {
             await client.query('ALTER TABLE ide_agent_memory DROP COLUMN IF EXISTS embedding');
             await client.query('ALTER TABLE ide_agent_memory ADD COLUMN embedding vector(1024)');
         } catch (e) {
-            console.log('Notice: ide_agent_memory alter failed:', e.message);
+            console.warn('Notice: optional ide_agent_memory alter skipped:', e.message);
         }
         
         try {
             await client.query('ALTER TABLE ide_agent_nuggets DROP COLUMN IF EXISTS embedding');
             await client.query('ALTER TABLE ide_agent_nuggets ADD COLUMN embedding vector(1024)');
         } catch (e) {
-            console.log('Notice: ide_agent_nuggets alter failed:', e.message);
+            console.warn('Notice: optional ide_agent_nuggets alter skipped:', e.message);
         }
 
         console.log('4. Recreating blobs_embedding_idx...');
@@ -33,6 +33,7 @@ async function migrate() {
         console.log('✅ Migration to 1024 dimensions completed successfully.');
     } catch (err) {
         console.error('❌ Migration failed:', err);
+        process.exitCode = 1;
     } finally {
         client.release();
         await pool.end();
