@@ -20,6 +20,7 @@ import {
 } from '../lib/embedding.js';
 import { extractSymbolsAndImports, extractCompactSymbolTokens, computeSymbolHash } from '../lib/ast-chunker.js';
 import { resolveSummaryModel } from '../config/ollama.js';
+import { isHydraGitEnabled, syncFileAstToHydraDb } from '../lib/hydradb-bridge.js';
 
 const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', '.ruff_cache', '.mypy_cache', 'data', 'tmp', '.gemini', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
 
@@ -232,6 +233,23 @@ export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath,
         await client.query('COMMIT');
         progress.symbols += symbols ? symbols.length : 0;
         progress.edges += imports ? imports.length : 0;
+
+        if (isHydraGitEnabled({ hydraClient: options.hydraClient, requireSyncFlag: !options.hydraClient })) {
+            try {
+                await syncFileAstToHydraDb({
+                    repoName: options.repoName || repoId,
+                    relativePath,
+                    sha,
+                    summary: options.summary || '',
+                    symbolSpine,
+                    symbols,
+                    imports,
+                    hydraClient: options.hydraClient || null
+                });
+            } catch (hydraErr) {
+                console.warn(`[HydraDB] Non-fatal AST sync warning for ${relativePath}: ${hydraErr.message}`);
+            }
+        }
     } catch (err) {
         try {
             await client.query('ROLLBACK');
@@ -300,7 +318,9 @@ export async function insertBlob(repoId, buffer, filePath, rootDir, progress = c
                         extractFn: options.extractFn,
                         embedBatchFn: options.embedBatchFn,
                         embedSymbols: options.embedSymbols,
-                        embedModel: activeModel
+                        embedModel: activeModel,
+                        repoName: resolvedRepoName,
+                        hydraClient: options.hydraClient
                     });
                 }
             }
@@ -348,7 +368,10 @@ export async function insertBlob(repoId, buffer, filePath, rootDir, progress = c
         extractFn: options.extractFn,
         embedBatchFn: options.embedBatchFn,
         embedSymbols: options.embedSymbols,
-        embedModel: activeModel
+        embedModel: activeModel,
+        repoName: resolvedRepoName,
+        summary,
+        hydraClient: options.hydraClient
     });
 
     return sha;

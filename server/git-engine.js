@@ -19,6 +19,11 @@ export async function createRepository(name, description) {
 }
 export { getRepositories, getRepository };
 import { buildExpandedEnglishQuery, expandCodeGraphBridges } from '../lib/graph-bridge.js';
+import {
+    isHydraGitEnabled,
+    searchHydraCodeBlobs,
+    getHydraSymbolGraph
+} from '../lib/hydradb-bridge.js';
 // Minimal placeholder for inserting a blob
 export async function insertBlob(repoId, buffer) {
     const sha = hashContent(buffer);
@@ -575,20 +580,27 @@ export async function searchBlobs(queryOrVector, limit = 5, repositoryId = null,
             LIMIT $5;
         `;
         const params = [textQuery, escapedLike, expandedQuery, scopedRepoId, safeLimit];
-        const res = await queryWithLegacySchemaFallback(sql, params, () => ({
-            sql: sql
-                .replace(/b\.symbol_spine,/g, 'NULL::text AS symbol_spine,')
-                .replace(/l\.symbol_spine,/g, 'NULL::text AS symbol_spine,'),
-            params
-        }));
-        if (shouldBridge && res.rows.length > 0) {
-            return await expandCodeGraphBridges(res.rows, textQuery, {
-                queryFn: query,
-                repositoryId: scopedRepoId,
-                limit: safeLimit
-            });
+        try {
+            const res = await queryWithLegacySchemaFallback(sql, params, () => ({
+                sql: sql
+                    .replace(/b\.symbol_spine,/g, 'NULL::text AS symbol_spine,')
+                    .replace(/l\.symbol_spine,/g, 'NULL::text AS symbol_spine,'),
+                params
+            }));
+            if (shouldBridge && res.rows.length > 0) {
+                return await expandCodeGraphBridges(res.rows, textQuery, {
+                    queryFn: query,
+                    repositoryId: scopedRepoId,
+                    limit: safeLimit
+                });
+            }
+            return res.rows;
+        } catch (pgErr) {
+            if (isHydraGitEnabled()) {
+                return await searchHydraCodeBlobs(textQuery, safeLimit, scopedRepoId);
+            }
+            throw pgErr;
         }
-        return res.rows;
     }
 
     return [];
@@ -861,89 +873,101 @@ export async function getSymbolsForBlob(blobId) {
  * @param {number} repositoryId - The repository ID.
  * @returns {Promise<{ filePath: string, repositoryId: number, symbols: Array, imports: Array, dependents: Array }>}
  */
-export async function getSymbolGraph(filePath, repositoryId) {
+export async function getSymbolGraph(filePath, repositoryId, options = {}) {
     const cleanFilePath = String(filePath || '').trim().replace(/^[/\\]+/, '');
     if (!cleanFilePath) {
         return { filePath: '', repositoryId, symbols: [], imports: [], dependents: [] };
     }
 
-    // Outbound imports (deduplicated by target_path + relation)
-    const importsRes = await query(`
-        SELECT DISTINCT ON (target_path, relation) target_path, relation, symbols
-        FROM code_symbol_edges
-        WHERE repository_id = $1 AND (source_path = $2 OR source_path = $3)
-        ORDER BY target_path ASC, relation ASC, id DESC
-    `, [repositoryId, cleanFilePath, filePath]);
+    const queryFn = options.queryFn || query;
 
-    // Inbound dependents (files that import this file)
-    const fileBase = path.posix.basename(cleanFilePath);
-    const baseName = path.posix.basename(cleanFilePath, path.posix.extname(cleanFilePath));
-    const dirName = path.posix.dirname(cleanFilePath);
-    const escapedCleanPath = cleanFilePath.replace(/[_%]/g, '\\$&');
-    const escapedBaseName = baseName.replace(/[_%]/g, '\\$&');
-    const isGeneric = ['index', 'main', 'app', 'utils', 'config', 'test', 'types', 'mod', 'lib'].includes(baseName.toLowerCase());
+    try {
+        // Outbound imports (deduplicated by target_path + relation)
+        const importsRes = await queryFn(`
+            SELECT DISTINCT ON (target_path, relation) target_path, relation, symbols
+            FROM code_symbol_edges
+            WHERE repository_id = $1 AND (source_path = $2 OR source_path = $3)
+            ORDER BY target_path ASC, relation ASC, id DESC
+        `, [repositoryId, cleanFilePath, filePath]);
 
-    let dependentsRes;
-    if (isGeneric || !baseName) {
-        const sameDirRelCandidates = [`./${fileBase}`, `./${baseName}`];
-        if (dirName && dirName !== '.') {
-            const escapedDirPrefix = dirName.replace(/[_%]/g, '\\$&') + '/%';
-            const dirPlusBase = `${dirName}/${baseName}`.replace(/[_%]/g, '\\$&');
-            dependentsRes = await query(`
+        // Inbound dependents (files that import this file)
+        const fileBase = path.posix.basename(cleanFilePath);
+        const baseName = path.posix.basename(cleanFilePath, path.posix.extname(cleanFilePath));
+        const dirName = path.posix.dirname(cleanFilePath);
+        const escapedCleanPath = cleanFilePath.replace(/[_%]/g, '\\$&');
+        const escapedBaseName = baseName.replace(/[_%]/g, '\\$&');
+        const isGeneric = ['index', 'main', 'app', 'utils', 'config', 'test', 'types', 'mod', 'lib'].includes(baseName.toLowerCase());
+
+        let dependentsRes;
+        if (isGeneric || !baseName) {
+            const sameDirRelCandidates = [`./${fileBase}`, `./${baseName}`];
+            if (dirName && dirName !== '.') {
+                const escapedDirPrefix = dirName.replace(/[_%]/g, '\\$&') + '/%';
+                const dirPlusBase = `${dirName}/${baseName}`.replace(/[_%]/g, '\\$&');
+                dependentsRes = await queryFn(`
+                    SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
+                    FROM code_symbol_edges
+                    WHERE repository_id = $1 
+                      AND (
+                          target_path = $2
+                          OR target_path ILIKE '%' || $3
+                          OR target_path ILIKE '%' || $4
+                          OR (source_path ILIKE $5 AND target_path = ANY($6))
+                      )
+                    ORDER BY source_path ASC, relation ASC, id DESC
+                `, [repositoryId, cleanFilePath, escapedCleanPath, dirPlusBase, escapedDirPrefix, sameDirRelCandidates]);
+            } else {
+                dependentsRes = await queryFn(`
+                    SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
+                    FROM code_symbol_edges
+                    WHERE repository_id = $1 
+                      AND (
+                          target_path = $2
+                          OR target_path ILIKE '%/' || $3
+                          OR target_path = ANY($4)
+                      )
+                    ORDER BY source_path ASC, relation ASC, id DESC
+                `, [repositoryId, cleanFilePath, escapedCleanPath, sameDirRelCandidates]);
+            }
+        } else {
+            dependentsRes = await queryFn(`
                 SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
                 FROM code_symbol_edges
                 WHERE repository_id = $1 
                   AND (
                       target_path = $2
                       OR target_path ILIKE '%' || $3
-                      OR target_path ILIKE '%' || $4
-                      OR (source_path ILIKE $5 AND target_path = ANY($6))
+                      OR target_path ILIKE '%' || $4 || '%'
                   )
                 ORDER BY source_path ASC, relation ASC, id DESC
-            `, [repositoryId, cleanFilePath, escapedCleanPath, dirPlusBase, escapedDirPrefix, sameDirRelCandidates]);
-        } else {
-            dependentsRes = await query(`
-                SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
-                FROM code_symbol_edges
-                WHERE repository_id = $1 
-                  AND (
-                      target_path = $2
-                      OR target_path ILIKE '%/' || $3
-                      OR target_path = ANY($4)
-                  )
-                ORDER BY source_path ASC, relation ASC, id DESC
-            `, [repositoryId, cleanFilePath, escapedCleanPath, sameDirRelCandidates]);
+            `, [repositoryId, cleanFilePath, escapedCleanPath, escapedBaseName]);
         }
-    } else {
-        dependentsRes = await query(`
-            SELECT DISTINCT ON (source_path, relation) source_path, relation, symbols
-            FROM code_symbol_edges
-            WHERE repository_id = $1 
-              AND (
-                  target_path = $2
-                  OR target_path ILIKE '%' || $3
-                  OR target_path ILIKE '%' || $4 || '%'
-              )
-            ORDER BY source_path ASC, relation ASC, id DESC
-        `, [repositoryId, cleanFilePath, escapedCleanPath, escapedBaseName]);
+
+        // File's own symbols (deduplicated by symbol_name, symbol_type, start_line)
+        const symbolsRes = await queryFn(`
+            SELECT DISTINCT ON (start_line, symbol_name, symbol_type)
+                symbol_name, symbol_type, start_line, end_line, signature, symbol_hash
+            FROM code_symbols
+            WHERE repository_id = $1 AND (file_path = $2 OR file_path = $3)
+            ORDER BY start_line ASC, symbol_name ASC, symbol_type ASC, id DESC
+        `, [repositoryId, cleanFilePath, filePath]);
+
+        return {
+            filePath: cleanFilePath,
+            repositoryId,
+            symbols: symbolsRes.rows,
+            imports: importsRes.rows,
+            dependents: dependentsRes.rows
+        };
+    } catch (pgErr) {
+        if (isHydraGitEnabled({ hydraClient: options.hydraClient })) {
+            return await getHydraSymbolGraph(cleanFilePath, repositoryId, {
+                hydraClient: options.hydraClient,
+                repoName: options.repoName || repositoryId
+            });
+        }
+        throw pgErr;
     }
-
-    // File's own symbols (deduplicated by symbol_name, symbol_type, start_line)
-    const symbolsRes = await query(`
-        SELECT DISTINCT ON (start_line, symbol_name, symbol_type)
-            symbol_name, symbol_type, start_line, end_line, signature, symbol_hash
-        FROM code_symbols
-        WHERE repository_id = $1 AND (file_path = $2 OR file_path = $3)
-        ORDER BY start_line ASC, symbol_name ASC, symbol_type ASC, id DESC
-    `, [repositoryId, cleanFilePath, filePath]);
-
-    return {
-        filePath: cleanFilePath,
-        repositoryId,
-        symbols: symbolsRes.rows,
-        imports: importsRes.rows,
-        dependents: dependentsRes.rows
-    };
 }
 
 
