@@ -19,6 +19,7 @@ import {
     PRIORITY
 } from '../lib/embedding.js';
 import { extractSymbolsAndImports, extractCompactSymbolTokens, computeSymbolHash } from '../lib/ast-chunker.js';
+import { initKruschGitTreeSitter, extractHybridSymbolsAndImports } from '../lib/treesitter-chunker.js';
 import { resolveSummaryModel } from '../config/ollama.js';
 import { isHydraGitEnabled, syncFileAstToHydraDb } from '../lib/hydradb-bridge.js';
 
@@ -143,7 +144,7 @@ async function generateInlineSummary(text, fileName) {
 export async function populateSymbolsAndEdges(sha, repoId, buffer, relativePath, ext, options = {}) {
     if (!isEmbeddable(ext)) return;
     const activePool = options.poolImpl || pool;
-    const extractFn = options.extractFn || extractSymbolsAndImports;
+    const extractFn = options.extractFn || extractHybridSymbolsAndImports || extractSymbolsAndImports;
     const embedBatchFn = options.embedBatchFn || getEmbeddingsBatch;
     const progress = options.progress || createSyncProgress();
     const shouldEmbedSymbols = options.embedSymbols === true || process.env.EMBED_CODE_SYMBOLS === 'true';
@@ -553,8 +554,10 @@ Environment Variables:
     const repoName = path.basename(targetDir);
     
     const progress = createSyncProgress();
+    const tsReady = await initKruschGitTreeSitter();
     console.log(`Starting Semantic PG-Git Snapshot for: ${repoName}`);
     console.log(`Target Directory: ${targetDir}`);
+    console.log(`AST Engine: ${tsReady ? 'web-tree-sitter-wasm (10 languages) + ast-chunker' : 'ast-chunker'}`);
     console.log(`LLM Summary Generation: ${process.env.SKIP_LLM_SUMMARY === 'true' ? 'DISABLED (avoid VRAM thrashing)' : 'ENABLED'}`);
 
     // Get or Create Repo
