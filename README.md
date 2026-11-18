@@ -76,6 +76,14 @@ Krusch-Git and [krusch-context-mcp](https://github.com/kruschdev/krusch-context-
 
 ## ⚡ Quick Start
 
+### Agent-Assisted Setup
+
+Ask your coding agent (Claude Code, Codex, Cursor, Windsurf, or Antigravity):
+
+```text
+Read https://raw.githubusercontent.com/kruschdev/krusch-git/main/INSTALL.md and set up krusch-git on this machine.
+```
+
 You **must** have [Ollama](https://ollama.com/) running with a `1024`-dimensional embedding model pulled (default: `snowflake-arctic-embed2`, `8,192`-token context; also supports `qwen3-embedding` MRL `1024d` or `bge-large`):
 ```bash
 ollama pull snowflake-arctic-embed2
