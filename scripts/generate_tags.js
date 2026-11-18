@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * Generate summaries and tags for external repo blobs using a local LLM.
- * Runs on kruschgame's RTX 3050 (qwen2.5-coder:1.5b) to avoid competing
- * with the embedding backfill on kruschdev/kruschserv.
+ * Runs on a dedicated secondary GPU (qwen2.5-coder:1.5b) to avoid competing
+ * with primary embedding backfill workers.
  *
  * Usage:
  *   node scripts/generate_tags.js --all-external
