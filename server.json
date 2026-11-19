@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "dev.krusch/krusch-git",
+  "title": "Krusch Git MCP",
+  "description": "Git DAG, AST symbol chunking, call-graph blast radius, and hybrid RRF code search MCP server.",
+  "repository": {
+    "url": "https://github.com/kruschdev/krusch-git",
+    "source": "github"
+  },
+  "version": "1.2.4",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "krusch-git",
+      "version": "1.2.4",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

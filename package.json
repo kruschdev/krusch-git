@@ -1,6 +1,6 @@
 {
   "name": "krusch-git",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Intelligent Git DAG, AST chunking, and codebase symbol search engine for AI coding agents. PostgreSQL + pgvector.",
   "main": "server/index.js",
   "bin": {
@@ -24,7 +24,8 @@
     "config.js",
     "docs",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "server.json"
   ],
   "scripts": {
     "test": "node --test tests/*.test.js",
@@ -58,5 +59,6 @@
     "fast-uri": "^4.2.3",
     "hono": "^4.13.11",
     "@hono/node-server": "^2.1.3"
-  }
+  },
+  "mcpName": "dev.krusch/krusch-git"
 }
