@@ -23,7 +23,7 @@ import { initKruschGitTreeSitter, extractHybridSymbolsAndImports } from '../lib/
 import { resolveSummaryModel } from '../config/ollama.js';
 import { isHydraGitEnabled, syncFileAstToHydraDb } from '../lib/hydradb-bridge.js';
 
-const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', '.ruff_cache', '.mypy_cache', 'data', 'tmp', '.gemini', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
+const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'dist-ext', 'build', '__pycache__', '.ruff_cache', '.mypy_cache', 'data', 'tmp', '.gemini', '.credentials', '.secrets', '.venv', 'venv', 'bench_venv', 'mcp_env', '.vscode', 'nodes', 'sandbox', 'logs', 'sandbox-audits', 'scratch', 'mnt', '.agent', '.turbo', '.next', 'out', '.nyc_output', '.source', 'public', 'r', 'kaggle_games_our']);
 
 /** Max file size for non-embeddable files (skip large binaries like .zip entirely) */
 const MAX_BINARY_SIZE = 100 * 1024; // 100KB
